@@ -11,7 +11,11 @@ discover(cwd) 가 모든 tier 누적해 SourceOfTruth 반환.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
+import os
 import subprocess
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -27,6 +31,7 @@ log = structlog.get_logger()
 # CLAUDE.md 계층 탐색 시 멈출 경계 (홈 디렉토리 위로 안 감)
 _CLAUDE_MD_NAME = "CLAUDE.md"
 _HOME = Path.home()
+_CACHE_TTL_SEC = int(os.environ.get("SOT_CACHE_TTL_SEC", "1800"))
 
 
 @dataclass
@@ -111,6 +116,108 @@ def _read_or_none(path: Path, limit: int = 60000) -> Optional[str]:
         return None
 
 
+def _cache_root(cwd: Path) -> Path:
+    p = cwd / ".hermes" / "cache" / "sot"
+    p.mkdir(parents=True, exist_ok=True)
+    return p
+
+
+def _mtime_key(path: Path) -> str:
+    try:
+        st = path.stat()
+        return f"{path}:{st.st_mtime_ns}:{st.st_size}"
+    except FileNotFoundError:
+        return f"{path}:missing"
+
+
+def _build_cache_key(cwd: Path, repo: str, claude_chain: list[Path]) -> str:
+    tracked: list[str] = []
+    tracked.extend([
+        _mtime_key(cwd / "ARCHITECTURE.md"),
+        _mtime_key(cwd / "README.md"),
+        _mtime_key(cwd / ".agentic.yml"),
+        _mtime_key(cwd / ".hermes" / "agent-context.md"),
+        _mtime_key(cwd / ".agent-context.md"),
+    ])
+    tracked.extend(_mtime_key(p) for p in claude_chain)
+
+    docs_dir = cwd / "docs"
+    if docs_dir.exists():
+        for p in sorted(docs_dir.rglob("*.md")):
+            tracked.append(_mtime_key(p))
+
+    git_head = ""
+    try:
+        git_head = subprocess.check_output(
+            ["git", "-C", str(cwd), "rev-parse", "HEAD"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except subprocess.CalledProcessError:
+        pass
+
+    raw = f"repo={repo}\nhead={git_head}\n" + "\n".join(tracked)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _serialize_sot(s: SourceOfTruth) -> dict:
+    return {
+        "repo": s.repo,
+        "cwd": str(s.cwd),
+        "claude_chain": [str(p) for p in s.claude_chain],
+        "architecture_md": s.architecture_md,
+        "readme_md": s.readme_md,
+        "agentic_yml": s.agentic_yml,
+        "recent_prs": s.recent_prs,
+        "recent_issues": s.recent_issues,
+        "last_commits": s.last_commits,
+        "agent_context_md": s.agent_context_md,
+        "docs_pages": s.docs_pages,
+        "adr_summaries": s.adr_summaries,
+    }
+
+
+def _deserialize_sot(payload: dict) -> SourceOfTruth:
+    return SourceOfTruth(
+        repo=payload.get("repo", ""),
+        cwd=Path(payload.get("cwd", ".")),
+        claude_chain=[Path(p) for p in payload.get("claude_chain", [])],
+        architecture_md=payload.get("architecture_md"),
+        readme_md=payload.get("readme_md"),
+        agentic_yml=payload.get("agentic_yml") or {},
+        recent_prs=payload.get("recent_prs") or [],
+        recent_issues=payload.get("recent_issues") or [],
+        last_commits=payload.get("last_commits") or [],
+        agent_context_md=payload.get("agent_context_md"),
+        docs_pages=payload.get("docs_pages") or {},
+        adr_summaries=payload.get("adr_summaries") or [],
+    )
+
+
+def _load_cache(cwd: Path, key: str) -> Optional[SourceOfTruth]:
+    fp = _cache_root(cwd) / f"{key}.json"
+    if not fp.exists():
+        return None
+    try:
+        payload = json.loads(fp.read_text(encoding="utf-8"))
+        created_at = float(payload.get("created_at", 0))
+        if time.time() - created_at > _CACHE_TTL_SEC:
+            return None
+        return _deserialize_sot(payload["sot"])
+    except Exception as exc:
+        log.warning("sot.cache_read_failed", error=str(exc), file=str(fp))
+        return None
+
+
+def _save_cache(cwd: Path, key: str, sot: SourceOfTruth) -> None:
+    fp = _cache_root(cwd) / f"{key}.json"
+    payload = {"created_at": time.time(), "sot": _serialize_sot(sot)}
+    try:
+        fp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    except Exception as exc:
+        log.warning("sot.cache_write_failed", error=str(exc), file=str(fp))
+
+
 def _parse_git_remote(cwd: Path) -> str:
     """`git remote get-url origin` 으로 'owner/repo' 추출."""
     try:
@@ -184,6 +291,15 @@ async def discover(cwd: Path | str) -> SourceOfTruth:
     if not repo:
         log.warning("sot.no_git_remote", cwd=str(cwd))
 
+    claude_chain = _collect_claude_chain(cwd)
+    cache_key = _build_cache_key(cwd, repo, claude_chain)
+    cached = _load_cache(cwd, cache_key)
+    if cached is not None:
+        log.info("sot.cache_hit", key=cache_key[:12], ttl_sec=_CACHE_TTL_SEC)
+        return cached
+
+    log.info("sot.cache_miss", key=cache_key[:12])
+
     # 정적 파일들 — ARCHITECTURE.md 는 cwd 또는 docs/ 둘 다 지원
     arch = _read_or_none(cwd / "ARCHITECTURE.md") or _read_or_none(cwd / "docs" / "ARCHITECTURE.md")
     readme = _read_or_none(cwd / "README.md")
@@ -193,15 +309,27 @@ async def discover(cwd: Path | str) -> SourceOfTruth:
         or _read_or_none(cwd / ".agent-context.md")
     )
 
+    agentic_yml = {}
+    agentic_path = cwd / ".agentic.yml"
+    if agentic_path.exists():
+        try:
+            agentic_yml = yaml.safe_load(agentic_path.read_text(encoding="utf-8")) or {}
+        except Exception as exc:
+            log.warning("sot.agentic_yml_parse_failed", error=str(exc))
+
     # docs/*.md 핵심 정책 (FEATURE_SPEC / ARCHITECTURE 제외 — 각각 크고 별도)
     docs_pages: dict[str, str] = {}
     docs_dir = cwd / "docs"
+    inline_docs = set((agentic_yml.get("sot", {}) or {}).get("inline_docs", []))
+    max_inline_chars = int((agentic_yml.get("sot", {}) or {}).get("max_inline_chars", 8000))
     if docs_dir.exists():
         skip = {"ARCHITECTURE.md", "FEATURE_SPEC.md"}
         for p in sorted(docs_dir.glob("*.md")):
             if p.name in skip:
                 continue
-            txt = _read_or_none(p, limit=20000)
+            if inline_docs and p.name not in inline_docs:
+                continue
+            txt = _read_or_none(p, limit=max_inline_chars)
             if txt:
                 docs_pages[p.name] = txt
 
@@ -214,15 +342,6 @@ async def discover(cwd: Path | str) -> SourceOfTruth:
             if txt:
                 adr_summaries.append({"stem": p.stem, "summary": txt})
 
-    agentic_yml = {}
-    agentic_path = cwd / ".agentic.yml"
-    if agentic_path.exists():
-        try:
-            agentic_yml = yaml.safe_load(agentic_path.read_text(encoding="utf-8")) or {}
-        except Exception as exc:
-            log.warning("sot.agentic_yml_parse_failed", error=str(exc))
-
-    claude_chain = _collect_claude_chain(cwd)
     last_commits = _git_log(cwd, limit=20)
 
     # 동적 — GitHub
@@ -237,7 +356,7 @@ async def discover(cwd: Path | str) -> SourceOfTruth:
         except Exception as exc:
             log.warning("sot.gh_recent_failed", error=str(exc))
 
-    return SourceOfTruth(
+    sot = SourceOfTruth(
         repo=repo,
         cwd=cwd,
         claude_chain=claude_chain,
@@ -251,3 +370,5 @@ async def discover(cwd: Path | str) -> SourceOfTruth:
         docs_pages=docs_pages,
         adr_summaries=adr_summaries,
     )
+    _save_cache(cwd, cache_key, sot)
+    return sot

@@ -147,7 +147,7 @@ async def run_code_executor(
                 tools=code_tools.TOOL_SCHEMAS,
                 tool_executor=_tool_exec,
                 stop_tool="submit_plan",          # LLM 이 이 도구 호출하면 즉시 plan 확정
-                max_iterations=15,
+                max_iterations=30,
                 max_tokens=16000,
                 cost_cap_usd=float(os.environ.get("EXECUTOR_COST_CAP", "0.80")),
             )
@@ -362,7 +362,7 @@ async def run_code_executor_amend(
                 tools=code_tools.TOOL_SCHEMAS,
                 tool_executor=_tool_exec,
                 stop_tool="submit_plan",
-                max_iterations=15,
+                max_iterations=30,
                 max_tokens=16000,
                 cost_cap_usd=float(os.environ.get("EXECUTOR_COST_CAP", "0.80")),
             )
