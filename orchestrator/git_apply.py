@@ -122,6 +122,8 @@ def _fuzzy_replace(text: str, old: str, new: str) -> tuple[str, bool]:
     return "\n".join(result), True
 
 
+# anchor fallback is intentionally conservative: only unique start/end anchors are accepted
+
 def _anchor_replace(text: str, old: str, new: str) -> tuple[str, bool]:
     """첫/끝 anchor line 기반 보수적 교체.
 
