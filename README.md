@@ -131,7 +131,7 @@ palette-po "친구 카운트 +1 안 됨 — 수정"
 # 사람은 PR review 후 merge 만
 ```
 
-자세한 docs: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
+자세한 docs: [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md), [`docs/PROJECT_SCAFFOLD.md`](docs/PROJECT_SCAFFOLD.md)
 
 ---
 
