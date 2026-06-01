@@ -5,6 +5,7 @@ description = "Project-agnostic agentic coding harness — label-based workflow.
 requires-python = ">=3.11"
 dependencies = [
     "anthropic>=0.40.0",
+    "openai>=1.40.0",
     "httpx>=0.27",
     "pyyaml>=6.0",
     "structlog>=24.0",

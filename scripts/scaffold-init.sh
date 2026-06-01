@@ -19,7 +19,7 @@ Required:
 
 Options:
   --project-name NAME     default: basename(project-dir)
-  --template-dir PATH     default: ~/dev-private/palette/.hermes
+  --template-dir PATH     default: <agentic-harness>/templates/.hermes
   --force                 overwrite existing .hermes
   --run-cron-setup        run target .hermes/cron-setup.sh after generation
   --dry-run               print actions only
@@ -30,7 +30,8 @@ EOF
 PROJECT_DIR=""
 REPO_SLUG=""
 PROJECT_NAME=""
-TEMPLATE_DIR="$HOME/dev-private/palette/.hermes"
+SCRIPT_HOME="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+TEMPLATE_DIR="$SCRIPT_HOME/../templates/.hermes"
 FORCE=0
 RUN_CRON=0
 DRY_RUN=0
@@ -61,6 +62,9 @@ PROJECT_UPPER="$(printf '%s' "$PROJECT_NAME" | tr '[:lower:]-' '[:upper:]_')"
 PROJECT_HERMES_DIR="$PROJECT_DIR/.hermes"
 PROJECT_PAT_VAR="${PROJECT_UPPER}_AGENT_PAT"
 
+TEMPLATE_REAL="$(cd "$TEMPLATE_DIR" && pwd)"
+TARGET_REAL="$PROJECT_HERMES_DIR"
+
 say() { echo "[scaffold] $*"; }
 run() {
   if [[ "$DRY_RUN" -eq 1 ]]; then
@@ -80,24 +84,32 @@ if [[ -e "$PROJECT_HERMES_DIR" && "$FORCE" -ne 1 ]]; then
   exit 1
 fi
 
+if [[ "$FORCE" -eq 1 && "$TEMPLATE_REAL" == "$TARGET_REAL" ]]; then
+  echo "❌ template-dir and target .hermes are the same path:" >&2
+  echo "   $TEMPLATE_REAL" >&2
+  echo "   --force would delete the template before copy." >&2
+  echo "   해결: --template-dir 를 다른 프로젝트의 .hermes 로 지정하거나 --force 없이 실행" >&2
+  exit 1
+fi
+
 if [[ "$FORCE" -eq 1 ]]; then
   run "rm -rf \"$PROJECT_HERMES_DIR\""
 fi
 
 run "mkdir -p \"$PROJECT_HERMES_DIR\""
-run "cp -R \"$TEMPLATE_DIR\"/* \"$PROJECT_HERMES_DIR\"/"
+run "cp -R \"$TEMPLATE_DIR\"/. \"$PROJECT_HERMES_DIR\"/"
 
 # rename palette-prefixed scripts -> <project>-*
 for role in pm executor reviewer; do
   src="$PROJECT_HERMES_DIR/scripts/palette-${role}.sh"
   dst="$PROJECT_HERMES_DIR/scripts/${PROJECT_SLUG}-${role}.sh"
-  if [[ -f "$src" ]]; then
+  if [[ -f "$src" && "$src" != "$dst" ]]; then
     run "mv \"$src\" \"$dst\""
   fi
 done
 
 # rename PO skill dir
-if [[ -d "$PROJECT_HERMES_DIR/skills/palette-po" ]]; then
+if [[ -d "$PROJECT_HERMES_DIR/skills/palette-po" && "$PROJECT_SLUG" != "palette" ]]; then
   run "mv \"$PROJECT_HERMES_DIR/skills/palette-po\" \"$PROJECT_HERMES_DIR/skills/${PROJECT_SLUG}-po\""
 fi
 
@@ -146,7 +158,14 @@ PROJECT_REPO_CWD=$PROJECT_DIR
 $PROJECT_PAT_VAR=ghp_xxx
 # optional generic fallback
 PROJECT_AGENT_PAT=
-# LLM
+
+# LLM provider
+LLM_PROVIDER=openai
+OPENAI_API_KEY=
+EXECUTOR_MODEL=gpt-5.3-codex
+REVIEWER_MODEL=gpt-5.3-codex
+
+# optional anthropic fallback
 ANTHROPIC_API_KEY=
 ANTHROPIC_AUTH_TOKEN=
 EOF
