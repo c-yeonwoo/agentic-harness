@@ -19,7 +19,7 @@ from typing import Optional
 
 import structlog
 
-from orchestrator import claude, code_tools, gh, git_apply, lock
+from orchestrator import code_tools, gh, git_apply, llm, lock
 from orchestrator.git_apply import EditApplyError
 from orchestrator.source_of_truth import SourceOfTruth
 
@@ -110,7 +110,7 @@ async def run_code_executor(
 
     Returns True if successful (next agent 가 받을 수 있는 상태로 전이).
     """
-    model = model or os.environ.get("EXECUTOR_MODEL", "claude-haiku-4-5-20251001")
+    model = model or os.environ.get("EXECUTOR_MODEL", "gpt-5.3-codex")
 
     if not await lock.acquire(repo, "issue", issue.number, bot_user):
         log.info("executor.lock_skipped", issue=issue.number)
@@ -140,7 +140,7 @@ async def run_code_executor(
             async def _tool_exec(name: str, args: dict) -> str:
                 return await code_tools.execute_tool(cwd, name, args)
 
-            result, call_info, tool_trace = await claude.call_with_tools(
+            result, call_info, tool_trace = await llm.call_with_tools(
                 model=model,
                 system=system_prompt,
                 user=user_msg,
@@ -265,7 +265,7 @@ async def run_code_executor_amend(
 
     Returns True if successful.
     """
-    model = model or os.environ.get("EXECUTOR_MODEL", "claude-haiku-4-5-20251001")
+    model = model or os.environ.get("EXECUTOR_MODEL", "gpt-5.3-codex")
 
     if not await lock.acquire(repo, "pr", pr.number, bot_user):
         log.info("executor.amend_lock_skipped", pr=pr.number)
@@ -355,7 +355,7 @@ async def run_code_executor_amend(
             async def _tool_exec(name: str, args: dict) -> str:
                 return await code_tools.execute_tool(cwd, name, args)
 
-            result, call_info, tool_trace = await claude.call_with_tools(
+            result, call_info, tool_trace = await llm.call_with_tools(
                 model=model,
                 system=system_prompt,
                 user=user_msg,
@@ -480,7 +480,7 @@ async def run_code_reviewer(
                                    (review comment 가 다음 사이클 SOT 의 recent PRs
                                    에 잡혀 context 로 들어감)
     """
-    model = model or os.environ.get("REVIEWER_MODEL", "claude-haiku-4-5-20251001")
+    model = model or os.environ.get("REVIEWER_MODEL", "gpt-5.3-codex")
 
     if not await lock.acquire(repo, "pr", pr.number, bot_user):
         log.info("reviewer.lock_skipped", pr=pr.number)
@@ -545,7 +545,7 @@ async def run_code_reviewer(
                 f"## Diff\n```diff\n{diff}\n```\n"
             )
 
-            text, call_info = await claude.call(
+            text, call_info = await llm.call(
                 model=model,
                 system=system_prompt,
                 user=user_msg,
@@ -630,7 +630,7 @@ async def run_code_reviewer(
         await lock.release(repo, "pr", pr.number, bot_user)
 
 
-def _format_review_comment(review: dict, call_info: claude.LlmCall) -> str:
+def _format_review_comment(review: dict, call_info: llm.LlmCall) -> str:
     verdict = review.get("verdict", "?")
     verdict_emoji = {
         "approve": "✅", "request_changes": "🔴", "concerns_noted": "🟡",
