@@ -683,6 +683,13 @@ def _format_review_comment(review: dict, call_info: llm.LlmCall) -> str:
             parts.append(f"- ✓ {p}")
         parts.append("")
 
+    if verdict == "request_changes":
+        parts += [
+            "### 머지 전 필수 조건",
+            "- [ ] CI(빌드/테스트) 전체 green 통과",
+            "",
+        ]
+
     parts += [
         "---",
         f"_cost ${call_info.cost_usd:.4f} · "
