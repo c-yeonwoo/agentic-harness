@@ -137,7 +137,7 @@ palette-po "친구 카운트 +1 안 됨 — 수정"
 
 ## 다른 프로젝트로 import
 
-1. 그 프로젝트 안에 `.hermes/` scaffold 작성 (`palette/.hermes/` 참고)
+1. 그 프로젝트 안에 `.hermes/` scaffold 작성 (`templates/.hermes/` 또는 `scripts/scaffold-init.sh` 사용)
 2. `.hermes/skills/<project>-po/SKILL.md` — 자연어 → issue 변환 (project-specific SoT 참조)
 3. `.hermes/scripts/<project>-{pm,executor,reviewer}.sh` — `~/dev-private/agentic-harness/orchestrator` 의 함수 호출 wrapper
 4. `bash .hermes/bootstrap.sh` 로 라벨 생성
