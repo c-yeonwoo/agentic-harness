@@ -122,6 +122,45 @@ def _fuzzy_replace(text: str, old: str, new: str) -> tuple[str, bool]:
     return "\n".join(result), True
 
 
+def _anchor_replace(text: str, old: str, new: str) -> tuple[str, bool]:
+    """첫/끝 anchor line 기반 보수적 교체.
+
+    exact/fuzzy 모두 실패했을 때 마지막 fallback.
+    """
+    text_lines = text.split("\n")
+    old_lines = old.split("\n")
+
+    sig = [ln.strip() for ln in old_lines if ln.strip()]
+    if len(sig) < 2:
+        return text, False
+
+    first = sig[0]
+    last = sig[-1]
+    stripped_text = [ln.strip() for ln in text_lines]
+
+    first_idxs = [i for i, ln in enumerate(stripped_text) if ln == first]
+    if not first_idxs:
+        return text, False
+
+    candidates: list[tuple[int, int]] = []
+    old_len = max(1, len(old_lines))
+    max_span = max(20, old_len * 4)
+
+    for s in first_idxs:
+        upper = min(len(text_lines), s + max_span)
+        for e in range(s + 1, upper):
+            if stripped_text[e] == last:
+                candidates.append((s, e))
+
+    if len(candidates) != 1:
+        return text, False
+
+    s, e = candidates[0]
+    new_lines = new.split("\n")
+    replaced = text_lines[:s] + new_lines + text_lines[e + 1:]
+    return "\n".join(replaced), True
+
+
 def _safe_path(root: Path, rel: str) -> Path:
     """경로 traversal 방지 — root 밖으로 못 나가게."""
     rel = rel.strip().lstrip("/")
@@ -153,10 +192,13 @@ async def apply_plan_and_push(
 
     base = await _detect_default_branch(repo_cwd)
     tmp_root = Path(tempfile.gettempdir()) / f"ah-{uuid.uuid4().hex[:8]}"
+    push_branch = ""
 
     if existing_branch:
         # ── amend mode — 기존 branch 의 최신 head 에서 worktree 분기 ──
         branch = existing_branch.strip()
+        push_branch = branch
+        work_branch = f"ah-amend-{uuid.uuid4().hex[:8]}"
         log.info("apply.worktree_create", path=str(tmp_root), branch=branch,
                  base=base, mode="amend")
         try:
@@ -165,13 +207,8 @@ async def apply_plan_and_push(
                 await _git(repo_cwd, "worktree", "prune")
             except RuntimeError:
                 pass
-            try:
-                # 같은 이름 local branch 있으면 삭제 (worktree 안 붙어있을 때만)
-                await _git(repo_cwd, "branch", "-D", branch)
-            except RuntimeError:
-                pass
-            # 기존 branch 체크아웃 (-B 로 reset, 그래서 origin 의 최신 head 추적)
-            await _git(repo_cwd, "worktree", "add", "-B", branch,
+            # 기존 branch 와 다른 임시 branch로 worktree 생성 (현재 checkout branch 충돌 회피)
+            await _git(repo_cwd, "worktree", "add", "-b", work_branch,
                        str(tmp_root), f"origin/{branch}")
         except RuntimeError:
             if tmp_root.exists():
@@ -180,6 +217,7 @@ async def apply_plan_and_push(
     else:
         # ── 신규 mode — base 에서 새 branch ──
         branch = plan.get("branch_name", "").strip()
+        push_branch = branch
         if not branch:
             raise RuntimeError("plan.branch_name 비어있음")
         allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_/.")
@@ -260,17 +298,25 @@ async def apply_plan_and_push(
                             )
                         count = text.count(old)
                         if count == 0:
-                            # whitespace 정규화 후 fuzzy 재시도 — LLM 이
-                            # leading whitespace 잘못 추정한 경우 살림.
-                            text, matched = _fuzzy_replace(text, old, new)
-                            if not matched:
-                                raise EditApplyError(
-                                    path=path, edit_idx=ei,
-                                    message="old_str 매칭 0회 — read_file 로 정확한 현재 내용 확인 후 다시 plan 필요",
-                                    old_str_head=old[:200],
-                                )
-                            log.info("apply.edit_fuzzy_match", path=path, idx=ei)
-                            continue
+                            # 1) whitespace 정규화
+                            text2, matched = _fuzzy_replace(text, old, new)
+                            if matched:
+                                text = text2
+                                log.info("apply.edit_fuzzy_match", path=path, idx=ei)
+                                continue
+
+                            # 2) anchor(첫/끝 유의미 line) 기반 보수적 fallback
+                            text3, matched2 = _anchor_replace(text, old, new)
+                            if matched2:
+                                text = text3
+                                log.info("apply.edit_anchor_match", path=path, idx=ei)
+                                continue
+
+                            raise EditApplyError(
+                                path=path, edit_idx=ei,
+                                message="old_str 매칭 0회 (exact/fuzzy/anchor 모두 실패) — read_file 로 현재 본문 재확인 후 더 긴 unique context 로 plan 필요",
+                                old_str_head=old[:200],
+                            )
                         if count > 1:
                             raise EditApplyError(
                                 path=path, edit_idx=ei,
@@ -303,7 +349,11 @@ async def apply_plan_and_push(
             )
 
         # push
-        await _git(tmp_root, "push", "-u", "origin", branch)
+        if existing_branch:
+            # amend: 임시 worktree branch HEAD 를 원본 branch 로 직접 push
+            await _git(tmp_root, "push", "origin", f"HEAD:{push_branch}")
+        else:
+            await _git(tmp_root, "push", "-u", "origin", push_branch)
 
         return {
             "branch": branch,
