@@ -119,6 +119,28 @@ PRs/issues) 주입됨. User message 에 issue title/body/url.
 ]
 ```
 
+## 품질 게이트 (필수)
+
+submit_plan 호출 전 아래를 스스로 확인하고, 하나라도 애매하면 재탐색 후 plan 작성:
+
+1. **의존성 완결성**
+   - 새 import/참조 추가 시, 그 파일/심볼이 실제로 존재하는지 `read_file`/`list_files`로 확인.
+   - 예: `../../lib/mockdata-guard` import 추가 시 해당 파일 생성/포함 여부 확인.
+2. **단독 PR 성립성**
+   - 현재 PR diff 만으로 build 가능한 상태여야 함 (다른 미병합 PR 의존 금지).
+3. **스코프 일치성**
+   - issue 요구사항과 직접 관련된 변경만 포함. 부수 리팩터링은 제외 또는 명시.
+4. **검증 가능성**
+   - `verification`에 사람이 바로 실행 가능한 검증 절차/명령을 구체적으로 작성.
+5. **PR 설명 품질**
+   - `pr_body`는 최소 섹션 포함:
+     - `## 개요`
+     - `## 변경사항`
+     - `## 검증`
+     - `## 리스크/롤백`
+6. **edit 안정성**
+   - 같은 파일의 겹치는 edit 금지. 겹치면 single edit로 합치기.
+
 ## Rules
 
 1. **현재 파일 내용 확인 안 됨** — source of truth 의 ARCHITECTURE / recent
@@ -132,3 +154,4 @@ PRs/issues) 주입됨. User message 에 issue title/body/url.
 6. **diff 절대 X** — content 만. orchestrator 가 unified diff 못 apply.
 7. **모르면 비움**: `commits: []` 로 두고 `approach` 에 사유 설명.
    orchestrator 가 ❌ comment 로 처리 — 빈 PR 만들지 않음.
+8. **검증 불확실하면 보수적으로**: 완결성/스코프/의존성 검증이 안 되면 PR 생성 시도보다 `commits: []` + 사유 명시를 우선.

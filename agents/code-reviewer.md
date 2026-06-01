@@ -74,3 +74,6 @@ PRs/issues) 주입. User message:
 5. **잘 한 점도 명시** — positives 1-2개. sandwich.
 6. **헷지 명시** — 추측이면 "추정" 표시.
 7. **한국어 comment** — 사용자가 한국어로 작업.
+8. **단독 머지 가능성 검사** — diff 기준으로 의존 파일 누락/깨진 import 의심 시 최소 major.
+9. **CI 신호 반영** — build/test 실패가 주어지면 기본 verdict 는 request_changes.
+10. **설명 품질 검사** — PR body 에 개요/변경사항/검증/리스크 정보가 없으면 minor 이상 지적.
