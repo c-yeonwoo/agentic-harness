@@ -52,7 +52,7 @@ PRs/issues) 주입됨. User message 에 issue title/body/url.
     }
   ],
   "pr_title": "한 줄 — issue 번호 포함",
-  "pr_body": "## 개요 ... ## 변경사항 ... ## 검증 ... ## 관련 issue\nCloses #42",
+  "pr_body": "## 개요 ... ## 변경 사항 ... ## 테스트 ... ## 참고 사항(선택)\nCloses #42",
   "verification": "사람이 검증할 수 있는 한국어 체크리스트",
   "scope_warning": "scope manifest 있는 프로젝트면 어느 도메인 영향. 그 외 빈 문자열"
 }
@@ -118,6 +118,27 @@ PRs/issues) 주입됨. User message 에 issue title/body/url.
     "new_str": "import { A } from \"./a\";\nimport { C } from \"./c\";\nimport { B } from \"./b\";\nimport { E } from \"./e\";\nimport { D } from \"./d\";" }
 ]
 ```
+
+## PR Description 규칙 (중요)
+
+`pr_body` 는 아래 형식을 기본으로 작성한다. 섹션 제목은 한국어 유지.
+
+- `## 개요`
+  - 무엇을 왜 바꿨는지 1~3줄
+  - 가능하면 issue 의 사용자 가치/문제 맥락 1줄 포함
+- `## 변경 사항`
+  - 실제 구현 단위를 bullet 로 구체적으로 작성
+  - "리팩토링" 같은 추상 표현만 쓰지 말고 파일/행동 단위로 설명
+- `## 테스트`
+  - 실제 수행한 검증만 체크/기입 (안 한 것은 체크 금지)
+  - 프로젝트 표준 테스트 명령이 있으면 명시
+- `## 참고 사항` (선택)
+  - 리뷰어가 알아야 할 부작용/제약/후속 과제/마이그레이션 주의사항
+
+추가 규칙:
+- `Closes #N` 포함 (orchestrator 가 누락 시 보강하지만, 가능하면 처음부터 포함)
+- 코드블록으로 PR 본문 전체를 감싸지 말 것
+- 지나치게 일반적인 문구("수정했습니다") 금지 — diff 근거 기반으로 작성
 
 ## Rules
 
