@@ -715,14 +715,15 @@ async def ensure_label(
 # 표준 라벨 정의 — color + description.
 # 전체 state machine: ADR-012 (Agent team 재정의) 참조.
 STANDARD_LABELS: list[tuple[str, str, str]] = [
-    ("ah:needs-execution", "fbca04", "developer 대기 (issue 신규 또는 PR amend)"),
+    # ADR-014: 워크플로우 라벨은 항상 정확히 1개 (배타적). lock 은 assignee 로 직교.
+    # ah:in-progress 폐기 — bot assignee 가 lock 역할.
+    ("ah:needs-execution", "fbca04", "developer 대기 (issue) — 새 task"),
     ("ah:needs-review",    "0e8a16", "reviewer 대기 (PR)"),
-    ("ah:in-debate",       "d4c5f9", "developer 가 review 에 반박 중 — 다음 tick reviewer 재평가"),
-    ("ah:needs-critique",  "5319e7", "reviewer 통과 후 critique final gate 대기"),
+    ("ah:in-debate",       "d4c5f9", "developer amend 대기 (PR) — reviewer push back"),
+    ("ah:needs-critique",  "5319e7", "critique final gate 대기 (PR)"),
     ("ah:awaiting-human",  "1d76db", "사람 결정 대기 (merge / escalation)"),
-    ("ah:in-progress",     "c5def5", "agent 가 처리 중 (락 — issue/PR)"),
     ("ah:sot-pending",     "fef2c0", "merged PR — PO mode B 가 SoT 갱신 필요"),
-    ("ah:sot-done",        "e6e6e6", "merged PR — PO mode B 가 처리 완료 (skip)"),
+    ("ah:sot-done",        "e6e6e6", "merged PR — PO mode B 처리 완료"),
 ]
 
 

@@ -1,7 +1,7 @@
 """Agent 실행 — Runner 추상화 위에서 동작.
 
 각 agent 의 공통 흐름:
-  1. lock 획득 (ah:in-progress 부착)
+  1. lock 획득 (assignee 로 bot 부착 — ADR-014)
   2. SoT discover + user prompt 빌드
   3. ExecutionContext 만들어 Runner.execute() 호출
      - HARNESS_MODE=hermes → ApiRunner (기존 ReAct + plan apply)
@@ -290,12 +290,10 @@ async def run_developer_amend(
         if edit_fail_count >= 2:
             log.warning("developer.amend.retry_cap_reached",
                         pr=pr.number, count=edit_fail_count)
-            # 둘 다 시도 — debate 사이클 (in-debate) 과 옛 흐름 (needs-execution) 모두
-            for lab in ("ah:in-debate", "ah:needs-execution"):
-                try:
-                    await gh.remove_label(repo, "pr", pr.number, lab)
-                except Exception:
-                    pass
+            try:
+                await gh.remove_label(repo, "pr", pr.number, "ah:in-debate")
+            except Exception:
+                pass
             try:
                 await gh.add_label(repo, "pr", pr.number, "ah:awaiting-human")
             except Exception:
@@ -369,13 +367,11 @@ async def run_developer_amend(
 
         if result.ok:
             # PR 은 이미 존재 — 라벨만 swap + 성공 코멘트
-            # debate cycle: ah:in-debate 와 옛 ah:needs-execution 둘 다 제거
-            # (둘 중 하나만 붙어 있든 둘 다 붙어 있든 안전하게)
-            for lab in ("ah:in-debate", "ah:needs-execution"):
-                try:
-                    await gh.remove_label(repo, "pr", pr.number, lab)
-                except Exception:
-                    pass
+            # debate cycle: ah:in-debate 제거 (reviewer 가 다시 평가할 차례)
+            try:
+                await gh.remove_label(repo, "pr", pr.number, "ah:in-debate")
+            except Exception:
+                pass
             try:
                 await gh.add_label(repo, "pr", pr.number, "ah:needs-review")
             except Exception as exc:
@@ -579,7 +575,7 @@ async def run_code_reviewer(
 
     verdict 별 처리 (ADR-012 debate cycle):
       - approve                                → `ah:awaiting-human` (사람 merge)
-      - request_changes / concerns_noted       → `ah:in-debate` + `ah:needs-execution`
+      - request_changes / concerns_noted       → `ah:in-debate`
                                                   (developer amend 사이클 — approve 까지 계속)
       - debate round cap (3회) 도달            → `ah:awaiting-human` (사람 escalation)
 
