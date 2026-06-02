@@ -206,12 +206,38 @@ async def run_developer(
 async def _handle_developer_failure(
     *, repo: str, kind: str, target_n: int, result, mode: str,
 ) -> bool:
-    """ExecutionResult.ok=False 의 error_kind 별 코멘트 + 라벨 처리. 호출자 컨텍스트 공유."""
+    """ExecutionResult.ok=False 의 error_kind 별 코멘트 + 라벨 처리.
+
+    라벨 배타성 보장 (ADR-014): 실패 시 현재 워크플로우 라벨 → ah:awaiting-human
+    으로 전이. edit_apply 만 예외 — retry queue 유지.
+    """
     comment_fn = gh.comment_issue if kind == "issue" else gh.comment_pr
 
+    # 현재 라벨 (워크플로우 라벨 1개) — 전이 시 제거
+    # issue: ah:needs-execution / PR: ah:in-debate (또는 ah:needs-execution 옛 흐름)
+    current_workflow_labels = (
+        ["ah:needs-execution"] if kind == "issue"
+        else ["ah:in-debate", "ah:needs-execution"]
+    )
+
+    async def _transition_to_awaiting_human():
+        """워크플로우 라벨 제거 + ah:awaiting-human 부착."""
+        for lab in current_workflow_labels:
+            try:
+                await gh.remove_label(repo, kind, target_n, lab)
+            except Exception:
+                pass
+        try:
+            await gh.add_label(repo, kind, target_n, "ah:awaiting-human")
+        except Exception as exc:
+            log.warning("developer.add_awaiting_label_failed",
+                        kind=kind, n=target_n, error=str(exc))
+
     if result.error_kind == "edit_apply":
+        # 자동 retry — 라벨 그대로 유지 (다음 tick 에 다시 시도)
         info = result.edit_apply_info or {}
         try:
+            retry_label = "ah:needs-execution" if kind == "issue" else "ah:in-debate"
             await comment_fn(repo, target_n,
                 f"❌ **edit 매칭 실패 — 자동 retry** (mode=`{mode}`)\n\n"
                 f"- 파일: `{info.get('path', '?')}`\n"
@@ -221,40 +247,46 @@ async def _handle_developer_failure(
                 f"```\n{info.get('old_str_head', '')}\n```\n\n"
                 f"💡 다음 tick 의 developer 가 이 코멘트를 SoT context 로 보고 "
                 f"현재 본문 재확인 후 plan 재생성. 무한 retry 멈추려면 "
-                f"`ah:needs-execution` 라벨 제거.\n\n"
+                f"`{retry_label}` 라벨 제거.\n\n"
                 f"{_cost_footer(result)}"
             )
+            # 라벨이 떨어졌으면 재부착 (보호) — edit_apply 는 retry queue 유지
             try:
-                await gh.add_label(repo, kind, target_n, "ah:needs-execution")
+                await gh.add_label(repo, kind, target_n, retry_label)
             except Exception:
                 pass
         except Exception as inner:
             log.warning("developer.edit_apply_comment_failed", error=str(inner))
-        # True 반환 — 호출자가 awaiting-human 부여 안 하게 (retry 큐 진행 의미)
+        # True 반환 — 호출자가 awaiting-human 부여 안 하게
         return True
 
     if result.error_kind == "no_changes":
+        # claude 가 작업 거부 (예: "이건 안 고치는 게 맞다") — 사람 결정으로 escalate
         try:
             await comment_fn(repo, target_n,
-                f"❌ **변경 사항 없음** (mode=`{mode}`)\n\n"
-                f"claude -p 실행은 끝났지만 worktree 변경 0건. "
-                f"프롬프트 부족 또는 모델이 작업 거부한 가능성.\n\n"
+                f"🛑 **변경 사항 없음 — 사람 결정 대기** (mode=`{mode}`)\n\n"
+                f"developer 가 worktree 변경 0건. 작업 거부 또는 \"이건 안 고치는 게 맞다\" 판단.\n\n"
                 f"summary: {result.summary or '(없음)'}\n\n"
+                f"라벨 전이: 현재 워크플로우 라벨 → `ah:awaiting-human`. "
+                f"사람이 PR/issue 보고 결정 (merge / 라벨 재부착으로 사이클 재개).\n\n"
                 f"{_cost_footer(result)}"
             )
         except Exception as inner:
             log.warning("developer.no_changes_comment_failed", error=str(inner))
+        await _transition_to_awaiting_human()
         return False
 
-    # no_plan / crashed / 기타
+    # no_plan / crashed / 기타 — 사람 escalation
     try:
         await comment_fn(repo, target_n,
-            f"❌ **developer 실패** (mode=`{mode}`, kind=`{result.error_kind or '?'}`)\n\n"
+            f"🛑 **developer 실패 — 사람 결정 대기** (mode=`{mode}`, kind=`{result.error_kind or '?'}`)\n\n"
             f"```\n{result.error or '(no error message)'}\n```\n\n"
+            f"라벨 전이: 현재 워크플로우 라벨 → `ah:awaiting-human`.\n\n"
             f"{_cost_footer(result)}"
         )
     except Exception as inner:
         log.warning("developer.failure_comment_failed", error=str(inner))
+    await _transition_to_awaiting_human()
     return False
 
 
