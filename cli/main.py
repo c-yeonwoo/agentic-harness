@@ -230,6 +230,139 @@ async def _run_impl(repo: str, cwd: Path, interval: int, once: bool) -> None:
 # ── init-labels ─────────────────────────────────────────────────────────────
 
 
+# ── init (all-in-one) ──────────────────────────────────────────────────────
+
+
+@app.command("init")
+def init(
+    repo: str = typer.Option(..., "--repo", "-r",
+                             help="bucketplace/lore 또는 c-yeonwoo/palette"),
+    cwd: Optional[Path] = typer.Option(None, "--cwd", "-c",
+                                       help="repo 로컬 경로. 기본 ~/dev-private/<name> 또는 ~/dev/<name>"),
+    interval: int = typer.Option(300, "--interval", "-i",
+                                 help="launchd cron 주기 (초)"),
+    skip_labels: bool = typer.Option(False, "--skip-labels", help="라벨 생성 skip"),
+    skip_sot: bool = typer.Option(False, "--skip-sot", help="SoT 부트스트랩 skip"),
+    skip_cron: bool = typer.Option(False, "--skip-cron", help="launchd 등록 skip"),
+    force_sot: bool = typer.Option(False, "--force-sot",
+                                   help="기존 SoT 파일 덮어쓰기 (위험)"),
+) -> None:
+    """한방 초기 셋업 — 라벨 8개 + SoT 부트스트랩 + macOS launchd cron.
+
+    어느 프로젝트든 이 명령 하나로 agent team 동작 시작 가능.
+    각 단계 멱등 — 기존 라벨/파일/cron 있으면 skip.
+    """
+    if cwd is None:
+        name = repo.split("/")[-1]
+        for cand in (Path.home() / "dev-private" / name, Path.home() / "dev" / name):
+            if (cand / ".git").exists():
+                cwd = cand
+                break
+        if cwd is None:
+            log.error("init.no_cwd", hint="--cwd 로 repo 로컬 경로 지정")
+            sys.exit(2)
+
+    asyncio.run(_init_impl(
+        repo=repo, cwd=cwd, interval=interval,
+        skip_labels=skip_labels, skip_sot=skip_sot, skip_cron=skip_cron,
+        force_sot=force_sot,
+    ))
+
+
+async def _init_impl(*, repo: str, cwd: Path, interval: int,
+                     skip_labels: bool, skip_sot: bool, skip_cron: bool,
+                     force_sot: bool) -> None:
+    print(f"\n▶ agentic-harness init — {repo}")
+    print(f"  cwd: {cwd}")
+    print(f"  interval: {interval}s\n")
+
+    # ── 1. 라벨 ────────────────────────────────────────────────────────────
+    if skip_labels:
+        print("⏭  [1/3] 라벨 생성 skip")
+    else:
+        print("▶ [1/3] 라벨 (ah:* 8개) ensure …")
+        try:
+            stats = await gh.ensure_standard_labels(repo)
+            if stats["created"]:
+                print(f"   ✓ 생성됨 ({len(stats['created'])}): {', '.join(stats['created'])}")
+            if stats["existed"]:
+                print(f"   - 이미 존재 ({len(stats['existed'])})")
+        except Exception as exc:
+            print(f"   ❌ 실패: {exc}")
+            sys.exit(1)
+
+    # ── 2. SoT 부트스트랩 ──────────────────────────────────────────────────
+    if skip_sot:
+        print("\n⏭  [2/3] SoT 부트스트랩 skip")
+    else:
+        print("\n▶ [2/3] SoT 부트스트랩 (claude -p 가 코드베이스 스캔) …")
+        if force_sot:
+            print("   ⚠ --force-sot — 기존 SoT 파일 덮어쓰기 모드")
+        from orchestrator import agents
+        result = await agents.run_sot_bootstrap(
+            repo=repo, repo_cwd=cwd, force_regenerate=force_sot,
+        )
+        if not result.get("ok"):
+            print(f"   ❌ SoT 부트스트랩 실패: {result.get('error', '?')}")
+            print(f"   (라벨/cron 은 계속 진행)")
+        else:
+            print(f"   ✓ {result.get('summary', '')}")
+            det = result.get("detected") or {}
+            print(f"   detected: {det.get('language', '?')} / "
+                  f"{det.get('framework', '?')} / {det.get('build', '?')}")
+            created = result.get("files_created") or []
+            skipped = result.get("files_skipped") or []
+            updated = result.get("files_updated") or []
+            if created:
+                print(f"   생성: {', '.join(created)}")
+            if updated:
+                print(f"   갱신: {', '.join(updated)}")
+            if skipped:
+                print(f"   skip: {len(skipped)}개 (이미 존재)")
+            todos = result.get("todos") or []
+            if todos:
+                print(f"   TODO ({len(todos)}):")
+                for t in todos[:5]:
+                    print(f"     - {t}")
+                if len(todos) > 5:
+                    print(f"     ... ({len(todos)-5}개 더)")
+            print(f"   cost: ${result.get('cost_usd', 0):.4f}")
+
+    # ── 3. launchd cron ────────────────────────────────────────────────────
+    if skip_cron:
+        print("\n⏭  [3/3] launchd 등록 skip")
+    else:
+        print("\n▶ [3/3] macOS LaunchAgent 등록 …")
+        import subprocess
+        script = _HARNESS_ROOT / "scripts" / "setup-local-launchd.sh"
+        if not script.exists():
+            print(f"   ❌ {script} 없음")
+            sys.exit(1)
+        try:
+            rc = subprocess.run(
+                ["bash", str(script), repo, str(interval), str(cwd)],
+                check=False,
+            ).returncode
+            if rc != 0:
+                print(f"   ❌ launchd 등록 실패 (rc={rc})")
+        except Exception as exc:
+            print(f"   ❌ launchd 실패: {exc}")
+
+    # ── 마무리 ──────────────────────────────────────────────────────────────
+    print(f"\n✓ init 완료. 다음 단계:")
+    print(f"")
+    print(f"  # 작업 던지기:")
+    print(f"  .venv/bin/ah add-task \"<자연어>\" --repo {repo} --dry-run")
+    print(f"  (--dry-run 으로 PO 결과 미리보고 OK 면 --dry-run 빼고 실제 생성)")
+    print(f"")
+    print(f"  # launchd 상태:")
+    print(f"  bash scripts/setup-local-launchd.sh --status")
+    print(f"")
+    print(f"  # 로그:")
+    print(f"  tail -f ~/Library/Logs/agentic-harness/{repo.replace('/', '-')}.out")
+    print(f"")
+
+
 @app.command("init-labels")
 def init_labels(
     repo: str = typer.Option(..., "--repo", "-r",

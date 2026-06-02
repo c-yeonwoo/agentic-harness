@@ -402,6 +402,68 @@ run_code_executor = run_developer
 run_code_executor_amend = run_developer_amend
 
 
+# ── SoT Bootstrap (ah init 의 일부) ──────────────────────────────────────────
+
+
+async def run_sot_bootstrap(
+    repo: str,
+    repo_cwd: Path,
+    force_regenerate: bool = False,
+    model: Optional[str] = None,
+) -> dict:
+    """프로젝트의 SoT 초안 작성 — CLAUDE.md / docs/ARCHITECTURE / GLOSSARY / CONVENTIONS / ADR-000.
+
+    이미 존재하는 파일은 force_regenerate=False 면 skip. claude -p 가 repo_cwd 에서
+    Glob/Read 로 코드베이스 스캔 후 Write 로 직접 파일 작성.
+
+    Returns: {ok, summary, detected, files_created, files_skipped, todos, cost_usd, error?}
+    """
+    if not (repo_cwd / ".git").exists():
+        return {"ok": False, "error": f"repo cwd 가 git repo 아님: {repo_cwd}"}
+
+    mode = resolve_mode("po")  # bootstrap 도 PO 모드 사용
+    if mode != "local":
+        return {"ok": False, "error": f"SoT bootstrap 은 local 모드만 지원 (현재 {mode})"}
+
+    # 기존 SoT 가 있으면 prompt 에 inject — 부분 갱신 모드 가능
+    sot_prompt = ""
+    try:
+        from orchestrator.source_of_truth import discover
+        sot = await discover(repo_cwd)
+        sot_prompt = sot.to_prompt()
+    except Exception as exc:
+        log.warning("sot_bootstrap.sot_discover_failed", error=str(exc))
+
+    from orchestrator.runners.local_claude import run_sot_bootstrap_local
+
+    log.info("sot_bootstrap.start", repo=repo, cwd=str(repo_cwd),
+             force=force_regenerate)
+
+    res = await run_sot_bootstrap_local(
+        repo_cwd=repo_cwd,
+        repo=repo,
+        force_regenerate=force_regenerate,
+        sot_prompt=sot_prompt,
+        model=model,
+    )
+
+    if res.error:
+        return {"ok": False, "error": res.error,
+                "cost_usd": res.cost_usd, "model": res.model}
+
+    return {
+        "ok": True,
+        "summary": res.summary,
+        "detected": res.detected,
+        "files_created": res.files_created,
+        "files_skipped": res.files_skipped,
+        "files_updated": res.files_updated,
+        "todos": res.todos,
+        "cost_usd": res.cost_usd,
+        "model": res.model,
+    }
+
+
 # ── PO (mode A — 자연어 → issue 분할) ─────────────────────────────────────────
 
 

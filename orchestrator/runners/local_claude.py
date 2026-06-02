@@ -339,6 +339,133 @@ def _parse_claude_json_envelope(stdout: str) -> tuple[Optional[str], dict]:
 
 
 @dataclass
+class LocalBootstrapResult:
+    """run_sot_bootstrap_local 의 반환 — 어떤 파일을 만들었는지 + 메타."""
+    summary: str
+    detected: dict                          # {language, framework, build, ...}
+    files_created: list[str]
+    files_skipped: list[str]
+    files_updated: list[str]
+    todos: list[str]
+    raw_text: str = ""
+    cost_usd: float = 0.0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    model: str = ""
+    error: Optional[str] = None
+
+
+async def run_sot_bootstrap_local(
+    *,
+    repo_cwd: Path,
+    repo: str,
+    force_regenerate: bool = False,
+    sot_prompt: str = "",
+    timeout_sec: int = 900,
+    model: Optional[str] = None,
+) -> LocalBootstrapResult:
+    """새 프로젝트의 SoT 초안 작성 — CLAUDE.md / docs/ARCHITECTURE.md / GLOSSARY / CONVENTIONS / ADR-000.
+
+    claude -p 가 repo_cwd 에서 직접 Edit/Write 로 파일 작성 (worktree 아님 — 실제 repo).
+    기존 파일은 force_regenerate=False 면 skip.
+    """
+    from orchestrator.runners import resolve_local_model
+    model = model or resolve_local_model("po")  # PO 와 비슷한 분석 작업 → sonnet default
+
+    agents_dir = Path(__file__).resolve().parent.parent.parent / "agents"
+    role_prompt_path = agents_dir / "sot-bootstrap-local.md"
+    if not role_prompt_path.exists():
+        return LocalBootstrapResult(
+            summary="", detected={}, files_created=[], files_skipped=[],
+            files_updated=[], todos=[],
+            error=f"agents/sot-bootstrap-local.md 없음 — {role_prompt_path}",
+        )
+    role_prompt = role_prompt_path.read_text(encoding="utf-8")
+    system_prompt = role_prompt
+    if sot_prompt:
+        system_prompt += "\n\n## 기존 SoT (있는 부분)\n\n" + sot_prompt
+
+    user_prompt = (
+        f"# SoT Bootstrap\n\n"
+        f"target repo: {repo}\n"
+        f"cwd: `{repo_cwd}`\n"
+        f"force_regenerate: {force_regenerate}\n\n"
+        f"위 cwd 의 코드베이스를 Glob/Read 로 빠르게 스캔하고, 빠진 SoT 파일들을 "
+        f"`Write` 로 작성. 기존 파일은 {'덮어쓰기 허용' if force_regenerate else 'skip'}.\n\n"
+        f"작업 끝나면 system prompt 의 schema 그대로 JSON 출력."
+    )
+
+    # SoT bootstrap 은 Edit/Write 허용 (다른 agent 와 달리)
+    # 단 git push / commit / gh 는 금지 — harness 책임
+    bootstrap_disallowed = [
+        "Bash(git push:*)", "Bash(git push)",
+        "Bash(git commit:*)", "Bash(git commit)",
+        "Bash(gh pr:*)", "Bash(gh issue:*)",
+    ]
+
+    log.info("sot_bootstrap.spawn", cwd=str(repo_cwd), repo=repo, model=model,
+             force=force_regenerate)
+
+    # _spawn_claude 의 disallowed 기본은 Edit/Write 금지가 아니라 git push 만 금지 — 그대로 OK
+    rc, stdout, stderr = await _spawn_claude(
+        cwd=repo_cwd,
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        timeout_sec=timeout_sec,
+        extra_disallowed=[],  # SoT 작성용 — Edit/Write 허용
+        model=model,
+    )
+
+    assistant_text, env = _parse_claude_json_envelope(stdout)
+    if assistant_text is None:
+        assistant_text = stdout
+
+    cost = float(env.get("total_cost_usd") or 0.0)
+    usage = env.get("usage") or {}
+    in_tok = int(usage.get("input_tokens") or 0)
+    out_tok = int(usage.get("output_tokens") or 0)
+    used_model = env.get("model") or model or ""
+    is_error_envelope = bool(env.get("is_error"))
+
+    if rc != 0 or is_error_envelope:
+        api_status = env.get("api_error_status")
+        detail = (assistant_text or "").strip() or stderr.strip() or stdout.strip()[:600]
+        err = f"SoT bootstrap failed — rc={rc} api_status={api_status}: {detail[:600]}"
+        log.warning("sot_bootstrap.failed",
+                    rc=rc, api_status=api_status, stderr_head=stderr[:500])
+        return LocalBootstrapResult(
+            summary="", detected={}, files_created=[], files_skipped=[],
+            files_updated=[], todos=[],
+            raw_text=assistant_text or "",
+            cost_usd=cost, input_tokens=in_tok, output_tokens=out_tok,
+            model=used_model, error=err,
+        )
+
+    payload = _extract_result_json(assistant_text)
+    if not isinstance(payload, dict):
+        m = re.search(r"```(?:json)?\s*\n(\{[\s\S]*?\})\s*\n```", assistant_text or "")
+        if m:
+            try:
+                payload = json.loads(m.group(1))
+            except json.JSONDecodeError:
+                payload = None
+    if not isinstance(payload, dict):
+        payload = {}
+
+    return LocalBootstrapResult(
+        summary=payload.get("summary") or "",
+        detected=payload.get("detected") or {},
+        files_created=payload.get("files_created") or [],
+        files_skipped=payload.get("files_skipped") or [],
+        files_updated=payload.get("files_updated") or [],
+        todos=payload.get("todos") or [],
+        raw_text=assistant_text or "",
+        cost_usd=cost, input_tokens=in_tok, output_tokens=out_tok,
+        model=used_model,
+    )
+
+
+@dataclass
 class LocalPoResult:
     """run_po_local 의 반환 — N 개 issue spec list + 메타.
 
