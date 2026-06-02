@@ -290,10 +290,12 @@ async def run_developer_amend(
         if edit_fail_count >= 2:
             log.warning("developer.amend.retry_cap_reached",
                         pr=pr.number, count=edit_fail_count)
-            try:
-                await gh.remove_label(repo, "pr", pr.number, "ah:needs-execution")
-            except Exception:
-                pass
+            # 둘 다 시도 — debate 사이클 (in-debate) 과 옛 흐름 (needs-execution) 모두
+            for lab in ("ah:in-debate", "ah:needs-execution"):
+                try:
+                    await gh.remove_label(repo, "pr", pr.number, lab)
+                except Exception:
+                    pass
             try:
                 await gh.add_label(repo, "pr", pr.number, "ah:awaiting-human")
             except Exception:
@@ -367,15 +369,13 @@ async def run_developer_amend(
 
         if result.ok:
             # PR 은 이미 존재 — 라벨만 swap + 성공 코멘트
-            # debate cycle: ah:in-debate 도 같이 제거 (이제 reviewer 가 재평가 차례)
-            try:
-                await gh.remove_label(repo, "pr", pr.number, "ah:needs-execution")
-            except Exception as exc:
-                log.warning("developer.amend.remove_label_failed", error=str(exc))
-            try:
-                await gh.remove_label(repo, "pr", pr.number, "ah:in-debate")
-            except Exception:
-                pass  # 없어도 OK
+            # debate cycle: ah:in-debate 와 옛 ah:needs-execution 둘 다 제거
+            # (둘 중 하나만 붙어 있든 둘 다 붙어 있든 안전하게)
+            for lab in ("ah:in-debate", "ah:needs-execution"):
+                try:
+                    await gh.remove_label(repo, "pr", pr.number, lab)
+                except Exception:
+                    pass
             try:
                 await gh.add_label(repo, "pr", pr.number, "ah:needs-review")
             except Exception as exc:
@@ -757,22 +757,19 @@ async def run_code_reviewer(
                             f"🛑 **debate round cap ({DEBATE_ROUND_CAP}) 도달 — 사람 결정 대기**\n\n"
                             f"reviewer 가 {debate_round-1}회 연속으로 approve 안 함. "
                             f"자동 amend 중단. 사람이 PR 직접 검토 후 결정.\n\n"
-                            f"이어서 자동 진행하려면 `ah:awaiting-human` → `ah:in-debate` + `ah:needs-execution` 로 라벨 교체."
+                            f"이어서 자동 진행하려면 `ah:awaiting-human` → `ah:in-debate` 로 라벨 교체."
                         )
                     except Exception as exc:
                         log.warning("reviewer.cap_comment_failed",
                                     pr=pr.number, error=str(exc))
                 else:
-                    # debate 사이클 진행 — developer amend 큐로
+                    # debate 사이클 진행 — ah:in-debate 단일 라벨이 trigger + 상태 둘 다
+                    # (이전엔 needs-execution 도 같이 붙였는데 redundant — needs-execution
+                    #  은 issue 전용 의미로 정리)
                     try:
                         await gh.add_label(repo, "pr", pr.number, "ah:in-debate")
                     except Exception as exc:
                         log.warning("reviewer.add_debate_label_failed",
-                                    pr=pr.number, error=str(exc))
-                    try:
-                        await gh.add_label(repo, "pr", pr.number, "ah:needs-execution")
-                    except Exception as exc:
-                        log.warning("reviewer.add_amend_label_failed",
                                     pr=pr.number, error=str(exc))
                     verdict_kor = {
                         "request_changes": "request_changes (🔴)",
@@ -784,7 +781,7 @@ async def run_code_reviewer(
                             f"— reviewer verdict: **{verdict_kor}**\n\n"
                             f"developer 가 amend mode 로 위 review 의견 반영 예정. "
                             f"approve 나올 때까지 이 사이클 반복 (cap {DEBATE_ROUND_CAP}회).\n\n"
-                            f"사람 개입 필요하면 PR 의 `ah:needs-execution` 라벨 뗼어서 멈출 수 있음."
+                            f"사람 개입 필요하면 PR 의 `ah:in-debate` 라벨 떼서 멈출 수 있음."
                         )
                     except Exception as exc:
                         log.warning("reviewer.debate_comment_failed",

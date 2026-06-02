@@ -81,6 +81,44 @@ async def poll_once(repo: str, cwd: Path, bot_user: str) -> dict:
             else:
                 stats["skipped"] += 1
 
+    # 3) ah:in-debate PRs → developer amend (ADR-012 debate cycle)
+    #    reviewer 가 concerns_noted / request_changes 면 PR 에 ah:in-debate 만 붙음.
+    #    poller 가 이걸 발견 → developer amend mode.
+    #    (옛 hermes 흐름은 ah:needs-execution PR 도 amend trigger 였음 — 같이 봄)
+    try:
+        d_candidates = await gh.list_prs(
+            repo, label="ah:in-debate", no_label="ah:in-progress",
+        )
+        # back-compat: 옛 흐름이 만든 ah:needs-execution PR 도 amend 대상
+        legacy = await gh.list_prs(
+            repo, label="ah:needs-execution", no_label="ah:in-progress",
+        )
+        # dedup
+        seen = {p.number for p in d_candidates}
+        for p in legacy:
+            if p.number not in seen:
+                d_candidates.append(p)
+    except Exception as exc:
+        log.warning("poll.list_failed", error=str(exc), agent="developer-amend")
+        d_candidates = []
+
+    if d_candidates:
+        log.info("poll.found", count=len(d_candidates), agent="developer-amend")
+        slots = d_candidates[:max_devs]
+        results = await asyncio.gather(
+            *[agents.run_developer_amend(repo, p, sot, bot_user, repo_cwd=cwd) for p in slots],
+            return_exceptions=True,
+        )
+        for r in results:
+            if isinstance(r, Exception):
+                stats["errors"] += 1
+                log.warning("poll.amend_exc", error=str(r))
+            elif r:
+                stats.setdefault("amended", 0)
+                stats["amended"] += 1
+            else:
+                stats["skipped"] += 1
+
     return stats
 
 
