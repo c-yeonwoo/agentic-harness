@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================================
-# Project Executor — issue/PR 번호 받아 agentic-harness executor 호출
+# Project Developer — issue/PR 번호 받아 agentic-harness developer 호출
+# (옛 이름 'executor'. 파일명은 hermes cron 호환 위해 유지. ADR-012 rename.)
 # ============================================================================
 # 호출:
 #   bash <project>-executor.sh <issue_number>
@@ -11,7 +12,7 @@
 #
 # 책임 분리:
 #   ReAct + edit + worktree + push + PR + Closes #N + cost 추적 모두
-#   agentic-harness 의 agents.run_code_executor() 가 처리.
+#   agentic-harness 의 agents.run_developer() 가 처리.
 #   이 script 는 venv activate + entrypoint 호출 + 락 해제만.
 # ============================================================================
 set -euo pipefail
@@ -50,9 +51,21 @@ if [ -n "${PROJECT_PAT:-}" ]; then
   export GITHUB_TOKEN="$PROJECT_PAT"
 fi
 
-# provider/model 기본값: codex 통일
+# Harness mode 분기 ----------------------------------------------------------
+# HARNESS_MODE=local  (default, ADR-011) — claude -p 헤드리스 (user OAuth).
+#                                          OPENAI_API_KEY 불필요. CLAUDE_BIN 만.
+# HARNESS_MODE=hermes                    — raw LLM API (OPENAI/ANTHROPIC). 디버깅용.
+# .env 에 HARNESS_MODE 설정하면 위 set -a; . "$env_file" 단계에서 자동 export 됨.
+export HARNESS_MODE="${HARNESS_MODE:-local}"
+
+# Local mode 모델 — 역할별 default (LOCAL_<ROLE>_MODEL 또는 LOCAL_CLAUDE_MODEL override)
+# 강제 export 안 함 — 미설정 시 코드의 role별 default (PO=sonnet, DEVELOPER=opus, ...) 사용
+
+# Hermes mode 만 의미 있는 변수 (HARNESS_MODE=hermes 일 때)
+# ADR-012 rename: DEVELOPER_MODEL 우선, EXECUTOR_MODEL 은 back-compat
 export LLM_PROVIDER="${LLM_PROVIDER:-openai}"
-export EXECUTOR_MODEL="${EXECUTOR_MODEL:-gpt-5.3-codex}"
+export DEVELOPER_MODEL="${DEVELOPER_MODEL:-${EXECUTOR_MODEL:-gpt-5.3-codex}}"
+export EXECUTOR_MODEL="${EXECUTOR_MODEL:-$DEVELOPER_MODEL}"
 
 # 빈 env 가드 — Anthropic fallback 사용 시만 의미
 [ -z "${ANTHROPIC_BASE_URL:-}" ] && unset ANTHROPIC_BASE_URL || true
@@ -84,19 +97,19 @@ async def main():
     target_n = int(os.environ['TARGET_N'])
     kind = os.environ.get('KIND', 'issue')
     sot = await sot_mod.discover(Path(os.environ['REPO_CWD']))
-    bot_user = await gh.whoami()
+    bot_user = await gh.whoami(repo)
     repo_cwd = Path(os.environ['REPO_CWD'])
 
     if kind == 'pr':
         # amend mode — PR 의 branch 에 추가 commit
         pr = await gh.get_pr(repo, target_n)
-        ok = await agents.run_code_executor_amend(
+        ok = await agents.run_developer_amend(
             repo=repo, pr=pr, sot=sot, bot_user=bot_user, repo_cwd=repo_cwd,
         )
     else:
         # 신규 mode — issue → 새 PR
         issue = await gh.get_issue(repo, target_n)
-        ok = await agents.run_code_executor(
+        ok = await agents.run_developer(
             repo=repo, issue=issue, sot=sot, bot_user=bot_user, repo_cwd=repo_cwd,
         )
     sys.exit(0 if ok else 1)
@@ -106,7 +119,7 @@ PYEOF
 EXIT=$?
 set -e
 
-# 락 해제 (성공 시 agents.run_code_executor* 가 라벨 swap 처리 — 락만) ---
+# 락 해제 (성공 시 agents.run_developer* 가 라벨 swap 처리 — 락만) ---
 gh "$KIND" edit "$TARGET_N" --repo "$REPO" --remove-label "ah:in-progress" 2>/dev/null || true
 if [ "$EXIT" -ne 0 ]; then
   gh "$KIND" edit "$TARGET_N" --repo "$REPO" --add-label "ah:awaiting-human" || true

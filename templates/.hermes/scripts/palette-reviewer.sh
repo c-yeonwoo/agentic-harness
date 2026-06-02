@@ -44,7 +44,11 @@ if [ -n "${PROJECT_PAT:-}" ]; then
   export GITHUB_TOKEN="$PROJECT_PAT"
 fi
 
-# provider/model 기본값: codex 통일
+# Harness mode 분기 — local (default, ADR-011) | hermes
+export HARNESS_MODE="${HARNESS_MODE:-local}"
+# 역할별 default 사용 (PO/REVIEWER=sonnet, DEVELOPER=opus) — LOCAL_CLAUDE_MODEL 강제 export 안 함
+
+# Hermes mode 만 의미 있는 변수
 export LLM_PROVIDER="${LLM_PROVIDER:-openai}"
 export REVIEWER_MODEL="${REVIEWER_MODEL:-gpt-5.3-codex}"
 
@@ -74,10 +78,11 @@ async def main():
     repo = os.environ['REPO']
     pr_n = int(os.environ['PR_N'])
     pr = await gh.get_pr(repo, pr_n)
-    sot = await sot_mod.discover(Path(os.environ['REPO_CWD']))
-    bot_user = await gh.whoami()
+    repo_cwd = Path(os.environ['REPO_CWD'])
+    sot = await sot_mod.discover(repo_cwd)
+    bot_user = await gh.whoami(repo)
     ok = await agents.run_code_reviewer(
-        repo=repo, pr=pr, sot=sot, bot_user=bot_user,
+        repo=repo, pr=pr, sot=sot, bot_user=bot_user, repo_cwd=repo_cwd,
     )
     sys.exit(0 if ok else 1)
 

@@ -1,20 +1,39 @@
-"""GitHub CLI wrapper — gh 가 이미 인증되어 있어야 동작.
+"""GitHub client — path-based backend 분기 (HTTP / gh CLI).
 
-이 모듈은 `gh` subprocess 호출만 함. 직접 GitHub API 호출 (httpx) 은
-나중에 GitHub App 으로 갈 때 swap. 지금은 단순성 우선.
+분기 규칙 (ADR-013):
+  - cwd 가 `~/dev-private/*` 아래  → HTTP backend ({REPO_BASE}_AGENT_PAT 사용)
+  - cwd 가 `~/dev/*` 아래            → gh CLI backend (gh CLI 인증 사용)
+  - 그 외 (또는 GH_BACKEND env)      → PAT 있으면 HTTP, 없으면 CLI
 
-모든 함수 async — subprocess 호출이 IO bound 라 asyncio 로 쉽게 병렬화.
+이전엔 gh CLI 단독이었지만, dev-private (c-yeonwoo 개인 repo) 가 gh CLI 의
+ohouse work 인증과 섞이는 문제가 있어 HTTP backend 추가. 두 backend 모두
+유지 — 같은 시그니처, 호출부 (agents.py / poller.py 등) 무수정.
+
+PAT 우선순위 (HTTP backend):
+  1. `{REPO_BASE_UPPER}_AGENT_PAT` — 예: PALETTE_AGENT_PAT for c-yeonwoo/palette
+  2. `GH_TOKEN`
+  3. `GITHUB_TOKEN`
 """
 from __future__ import annotations
 
 import asyncio
 import json
+import os
+import re
 from dataclasses import dataclass
-from typing import Optional
+from pathlib import Path
+from typing import Any, Optional
 
+import httpx
 import structlog
 
 log = structlog.get_logger()
+
+GITHUB_API_BASE = "https://api.github.com"
+_HTTP_TIMEOUT = float(os.environ.get("GH_HTTP_TIMEOUT", "30"))
+
+
+# ── Types ────────────────────────────────────────────────────────────────────
 
 
 @dataclass
@@ -50,11 +69,157 @@ class PullRequest:
         return set(self.labels)
 
 
-# ── Internals ───────────────────────────────────────────────────────────────
+# ── Backend 분기 ────────────────────────────────────────────────────────────
 
 
-async def _run(cmd: list[str], input_str: Optional[str] = None) -> str:
-    """gh subprocess 실행. stderr 에 오류 있으면 raise."""
+def _pat_env_name(repo: str) -> str:
+    """c-yeonwoo/palette → PALETTE_AGENT_PAT. 대시는 언더스코어로."""
+    base = repo.split("/")[-1]
+    return base.upper().replace("-", "_") + "_AGENT_PAT"
+
+
+def _use_http(repo: str) -> bool:
+    """`~/dev-private/*` → HTTP, `~/dev/*` → CLI, 그 외 → PAT 있으면 HTTP.
+
+    cwd 가 `~/dev-private/` 의 하위인지로 판정 (`dev-private` 라는 이름의 디렉토리가
+    경로 어딘가에 끼는 false positive 방지).
+
+    GH_BACKEND env override 가능 ('http' | 'cli').
+    """
+    override = os.environ.get("GH_BACKEND", "").strip().lower()
+    if override in ("http", "cli"):
+        return override == "http"
+
+    cwd = Path.cwd().resolve()
+    home = Path.home().resolve()
+    dev_private = home / "dev-private"
+    dev = home / "dev"
+
+    try:
+        cwd.relative_to(dev_private)
+        return True
+    except ValueError:
+        pass
+    try:
+        cwd.relative_to(dev)
+        return False
+    except ValueError:
+        pass
+
+    # 두 디렉토리 어느 쪽도 아니면 PAT 존재 여부로
+    return bool(os.environ.get(_pat_env_name(repo)))
+
+
+# ── HTTP backend ─────────────────────────────────────────────────────────────
+
+
+def _pat_for(repo: str) -> str:
+    primary = _pat_env_name(repo)
+    pat = os.environ.get(primary)
+    if pat:
+        return pat
+    for fallback in ("GH_TOKEN", "GITHUB_TOKEN"):
+        pat = os.environ.get(fallback)
+        if pat:
+            return pat
+    raise RuntimeError(
+        f"HTTP backend: PAT 없음 for {repo}. "
+        f"{primary} 또는 GH_TOKEN / GITHUB_TOKEN 설정 필요."
+    )
+
+
+def _headers(repo: str, accept: str = "application/vnd.github+json") -> dict:
+    return {
+        "Accept": accept,
+        "X-GitHub-Api-Version": "2022-11-28",
+        "Authorization": f"Bearer {_pat_for(repo)}",
+        "User-Agent": "agentic-harness",
+    }
+
+
+async def _request(
+    repo: str,
+    method: str,
+    path: str,
+    *,
+    params: Optional[dict] = None,
+    json_body: Optional[Any] = None,
+    accept: str = "application/vnd.github+json",
+    expect_404_ok: bool = False,
+) -> httpx.Response:
+    url = f"{GITHUB_API_BASE}{path}"
+    async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT) as client:
+        r = await client.request(
+            method, url, headers=_headers(repo, accept), params=params, json=json_body,
+        )
+    if r.status_code == 404 and expect_404_ok:
+        return r
+    if r.status_code >= 400:
+        body = r.text[:600]
+        log.warning("gh.http_error", method=method, path=path,
+                    status=r.status_code, body=body[:300])
+        raise RuntimeError(
+            f"GitHub API {method} {path} → {r.status_code}: {body[:300]}"
+        )
+    return r
+
+
+async def _get_json(repo: str, path: str, params: Optional[dict] = None) -> Any:
+    return (await _request(repo, "GET", path, params=params)).json()
+
+
+async def _post_json(repo: str, path: str, payload: dict) -> Any:
+    r = await _request(repo, "POST", path, json_body=payload)
+    return r.json() if r.content else {}
+
+
+async def _patch_json(repo: str, path: str, payload: dict) -> Any:
+    r = await _request(repo, "PATCH", path, json_body=payload)
+    return r.json() if r.content else {}
+
+
+async def _delete(repo: str, path: str) -> None:
+    await _request(repo, "DELETE", path, expect_404_ok=True)
+
+
+def _parse_issue_http(raw: dict) -> Issue:
+    return Issue(
+        number=raw["number"],
+        title=raw.get("title", "") or "",
+        body=raw.get("body", "") or "",
+        labels=[lab["name"] for lab in raw.get("labels", []) if isinstance(lab, dict)],
+        assignees=[a["login"] for a in raw.get("assignees", []) if isinstance(a, dict)],
+        url=raw.get("html_url", raw.get("url", "")) or "",
+    )
+
+
+def _parse_pr_http(raw: dict) -> PullRequest:
+    state = (raw.get("state") or "open").lower()
+    merged = bool(raw.get("merged") or raw.get("merged_at"))
+    if merged:
+        state = "merged"
+    head = raw.get("head") or {}
+    base = raw.get("base") or {}
+    return PullRequest(
+        number=raw["number"],
+        title=raw.get("title", "") or "",
+        body=raw.get("body", "") or "",
+        head_ref=head.get("ref", "") if isinstance(head, dict) else "",
+        base_ref=base.get("ref", "") if isinstance(base, dict) else "",
+        labels=[lab["name"] for lab in raw.get("labels", []) if isinstance(lab, dict)],
+        assignees=[a["login"] for a in raw.get("assignees", []) if isinstance(a, dict)],
+        state=state,
+        merged=merged,
+        merged_at=raw.get("merged_at"),
+        url=raw.get("html_url", "") or "",
+    )
+
+
+# ── gh CLI backend ───────────────────────────────────────────────────────────
+
+
+async def _gh_run(cmd: list[str], input_str: Optional[str] = None) -> str:
+    """gh subprocess. stderr 에 오류면 raise."""
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdin=asyncio.subprocess.PIPE if input_str else None,
@@ -66,35 +231,35 @@ async def _run(cmd: list[str], input_str: Optional[str] = None) -> str:
     )
     if proc.returncode != 0:
         msg = stderr.decode().strip() or "gh CLI 실패"
-        log.warning("gh.call_failed", cmd=cmd, error=msg)
+        log.warning("gh.cli_failed", cmd=cmd, error=msg)
         raise RuntimeError(f"gh: {msg}")
     return stdout.decode()
 
 
-def _parse_issue(raw: dict) -> Issue:
+def _parse_issue_cli(raw: dict) -> Issue:
     return Issue(
         number=raw["number"],
-        title=raw.get("title", ""),
-        body=raw.get("body", ""),
+        title=raw.get("title", "") or "",
+        body=raw.get("body", "") or "",
         labels=[lab["name"] for lab in raw.get("labels", [])],
         assignees=[a["login"] for a in raw.get("assignees", [])],
-        url=raw.get("url", ""),
+        url=raw.get("url", "") or "",
     )
 
 
-def _parse_pr(raw: dict) -> PullRequest:
+def _parse_pr_cli(raw: dict) -> PullRequest:
     return PullRequest(
         number=raw["number"],
-        title=raw.get("title", ""),
-        body=raw.get("body", ""),
+        title=raw.get("title", "") or "",
+        body=raw.get("body", "") or "",
         head_ref=raw.get("headRefName", ""),
         base_ref=raw.get("baseRefName", ""),
         labels=[lab["name"] for lab in raw.get("labels", [])],
         assignees=[a["login"] for a in raw.get("assignees", [])],
-        state=raw.get("state", "OPEN").lower(),
+        state=(raw.get("state") or "open").lower(),
         merged=raw.get("state", "").upper() == "MERGED",
         merged_at=raw.get("mergedAt"),
-        url=raw.get("url", ""),
+        url=raw.get("url", "") or "",
     )
 
 
@@ -108,34 +273,39 @@ async def list_issues(
     state: str = "open",
     limit: int = 30,
 ) -> list[Issue]:
-    """label 매칭 issue 목록. no_label 은 제외 필터.
+    if _use_http(repo):
+        params: dict[str, Any] = {"state": state, "per_page": min(limit, 100)}
+        if label:
+            params["labels"] = label
+        data = await _get_json(repo, f"/repos/{repo}/issues", params=params)
+        issues_only = [x for x in data if "pull_request" not in x]
+        items = [_parse_issue_http(x) for x in issues_only[:limit]]
+    else:
+        cmd = [
+            "gh", "issue", "list",
+            "--repo", repo,
+            "--state", state,
+            "--limit", str(limit),
+            "--json", "number,title,body,labels,assignees,url",
+        ]
+        if label:
+            cmd += ["--label", label]
+        items = [_parse_issue_cli(x) for x in json.loads(await _gh_run(cmd))]
 
-    gh issue list 자체가 `--label X` 만 지원 (negation X) 이라
-    `no_label` 은 client-side 필터.
-    """
-    cmd = [
-        "gh", "issue", "list",
-        "--repo", repo,
-        "--state", state,
-        "--limit", str(limit),
-        "--json", "number,title,body,labels,assignees,url",
-    ]
-    if label:
-        cmd += ["--label", label]
-    raw = json.loads(await _run(cmd))
-    items = [_parse_issue(x) for x in raw]
     if no_label:
         items = [i for i in items if no_label not in i.label_set]
     return items
 
 
 async def get_issue(repo: str, number: int) -> Issue:
+    if _use_http(repo):
+        return _parse_issue_http(await _get_json(repo, f"/repos/{repo}/issues/{number}"))
     cmd = [
         "gh", "issue", "view", str(number),
         "--repo", repo,
         "--json", "number,title,body,labels,assignees,url",
     ]
-    return _parse_issue(json.loads(await _run(cmd)))
+    return _parse_issue_cli(json.loads(await _gh_run(cmd)))
 
 
 async def create_issue(
@@ -144,26 +314,28 @@ async def create_issue(
     body: str,
     labels: list[str] = (),
 ) -> Issue:
-    cmd = [
-        "gh", "issue", "create",
-        "--repo", repo,
-        "--title", title,
-        "--body", body,
-    ]
+    if _use_http(repo):
+        payload: dict = {"title": title, "body": body}
+        if labels:
+            payload["labels"] = list(labels)
+        return _parse_issue_http(await _post_json(repo, f"/repos/{repo}/issues", payload))
+
+    cmd = ["gh", "issue", "create", "--repo", repo, "--title", title, "--body", body]
     for lab in labels:
         cmd += ["--label", lab]
-    out = (await _run(cmd)).strip()
-    # gh issue create 는 마지막 줄에 URL 만 출력
+    out = (await _gh_run(cmd)).strip()
     url = out.splitlines()[-1].strip()
     number = int(url.rstrip("/").split("/")[-1])
     return await get_issue(repo, number)
 
 
 async def comment_issue(repo: str, number: int, body: str) -> None:
-    await _run([
+    if _use_http(repo):
+        await _post_json(repo, f"/repos/{repo}/issues/{number}/comments", {"body": body})
+        return
+    await _gh_run([
         "gh", "issue", "comment", str(number),
-        "--repo", repo,
-        "--body-file", "-",
+        "--repo", repo, "--body-file", "-",
     ], input_str=body)
 
 
@@ -171,35 +343,53 @@ async def comment_issue(repo: str, number: int, body: str) -> None:
 
 
 async def add_label(repo: str, kind: str, number: int, label: str) -> None:
-    """kind: issue | pr"""
-    await _run([
-        "gh", kind, "edit", str(number),
-        "--repo", repo,
-        "--add-label", label,
+    if _use_http(repo):
+        await _post_json(
+            repo, f"/repos/{repo}/issues/{number}/labels", {"labels": [label]},
+        )
+        return
+    await _gh_run([
+        "gh", kind, "edit", str(number), "--repo", repo, "--add-label", label,
     ])
 
 
 async def remove_label(repo: str, kind: str, number: int, label: str) -> None:
-    await _run([
-        "gh", kind, "edit", str(number),
-        "--repo", repo,
-        "--remove-label", label,
+    if _use_http(repo):
+        from urllib.parse import quote
+        await _delete(
+            repo, f"/repos/{repo}/issues/{number}/labels/{quote(label, safe='')}",
+        )
+        return
+    await _gh_run([
+        "gh", kind, "edit", str(number), "--repo", repo, "--remove-label", label,
     ])
 
 
 async def assign(repo: str, kind: str, number: int, user: str) -> None:
-    await _run([
-        "gh", kind, "edit", str(number),
-        "--repo", repo,
-        "--add-assignee", user,
+    if _use_http(repo):
+        await _post_json(
+            repo, f"/repos/{repo}/issues/{number}/assignees", {"assignees": [user]},
+        )
+        return
+    await _gh_run([
+        "gh", kind, "edit", str(number), "--repo", repo, "--add-assignee", user,
     ])
 
 
 async def unassign(repo: str, kind: str, number: int, user: str) -> None:
-    await _run([
-        "gh", kind, "edit", str(number),
-        "--repo", repo,
-        "--remove-assignee", user,
+    if _use_http(repo):
+        async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT) as client:
+            r = await client.request(
+                "DELETE",
+                f"{GITHUB_API_BASE}/repos/{repo}/issues/{number}/assignees",
+                headers=_headers(repo),
+                json={"assignees": [user]},
+            )
+        if r.status_code >= 400 and r.status_code != 404:
+            raise RuntimeError(f"unassign → {r.status_code}: {r.text[:300]}")
+        return
+    await _gh_run([
+        "gh", kind, "edit", str(number), "--repo", repo, "--remove-assignee", user,
     ])
 
 
@@ -213,96 +403,152 @@ async def list_prs(
     state: str = "open",
     limit: int = 30,
 ) -> list[PullRequest]:
-    cmd = [
-        "gh", "pr", "list",
-        "--repo", repo,
-        "--state", state,
-        "--limit", str(limit),
-        "--json", "number,title,body,headRefName,baseRefName,labels,assignees,state,mergedAt,url",
-    ]
-    if label:
-        cmd += ["--label", label]
-    raw = json.loads(await _run(cmd))
-    items = [_parse_pr(x) for x in raw]
+    if _use_http(repo):
+        if label:
+            # /pulls 는 label 필터 미지원 — /issues (PR 포함) 후 detail GET
+            params: dict[str, Any] = {
+                "state": state, "labels": label, "per_page": min(limit, 100),
+            }
+            data = await _get_json(repo, f"/repos/{repo}/issues", params=params)
+            pr_only = [x for x in data if "pull_request" in x]
+            items: list[PullRequest] = []
+            for x in pr_only[:limit]:
+                try:
+                    full = await _get_json(repo, f"/repos/{repo}/pulls/{x['number']}")
+                    items.append(_parse_pr_http(full))
+                except Exception as exc:
+                    log.warning("gh.pr_detail_failed", number=x["number"], error=str(exc))
+        else:
+            data = await _get_json(
+                repo, f"/repos/{repo}/pulls",
+                params={"state": state, "per_page": min(limit, 100)},
+            )
+            items = [_parse_pr_http(x) for x in data[:limit]]
+    else:
+        cmd = [
+            "gh", "pr", "list",
+            "--repo", repo,
+            "--state", state,
+            "--limit", str(limit),
+            "--json", "number,title,body,headRefName,baseRefName,labels,assignees,state,mergedAt,url",
+        ]
+        if label:
+            cmd += ["--label", label]
+        items = [_parse_pr_cli(x) for x in json.loads(await _gh_run(cmd))]
+
     if no_label:
         items = [p for p in items if no_label not in p.label_set]
     return items
 
 
 async def get_pr(repo: str, number: int) -> PullRequest:
+    if _use_http(repo):
+        return _parse_pr_http(await _get_json(repo, f"/repos/{repo}/pulls/{number}"))
     cmd = [
         "gh", "pr", "view", str(number),
         "--repo", repo,
         "--json", "number,title,body,headRefName,baseRefName,labels,assignees,state,mergedAt,url",
     ]
-    return _parse_pr(json.loads(await _run(cmd)))
+    return _parse_pr_cli(json.loads(await _gh_run(cmd)))
 
 
 async def comment_pr(repo: str, number: int, body: str) -> None:
-    await _run([
+    if _use_http(repo):
+        # PR comments are issue comments
+        await _post_json(repo, f"/repos/{repo}/issues/{number}/comments", {"body": body})
+        return
+    await _gh_run([
         "gh", "pr", "comment", str(number),
-        "--repo", repo,
-        "--body-file", "-",
+        "--repo", repo, "--body-file", "-",
     ], input_str=body)
 
 
 async def close_pr(repo: str, number: int, comment: Optional[str] = None) -> None:
-    """PR close. comment 있으면 close 직전에 부착."""
     if comment:
         try:
             await comment_pr(repo, number, comment)
         except Exception as exc:
             log.warning("gh.close_pr_comment_failed", error=str(exc))
-    await _run(["gh", "pr", "close", str(number), "--repo", repo])
+
+    if _use_http(repo):
+        await _patch_json(repo, f"/repos/{repo}/pulls/{number}", {"state": "closed"})
+        return
+    await _gh_run(["gh", "pr", "close", str(number), "--repo", repo])
 
 
 async def reopen_issue(repo: str, number: int) -> None:
-    """이미 closed 된 issue 다시 열기 (재트리거 용)."""
-    await _run(["gh", "issue", "reopen", str(number), "--repo", repo])
+    if _use_http(repo):
+        await _patch_json(repo, f"/repos/{repo}/issues/{number}", {"state": "open"})
+        return
+    await _gh_run(["gh", "issue", "reopen", str(number), "--repo", repo])
 
 
 async def pr_diff(repo: str, number: int, max_bytes: int = 80_000) -> str:
-    """PR unified diff. 너무 크면 잘림."""
-    out = await _run(["gh", "pr", "diff", str(number), "--repo", repo])
+    if _use_http(repo):
+        r = await _request(
+            repo, "GET", f"/repos/{repo}/pulls/{number}",
+            accept="application/vnd.github.v3.diff",
+        )
+        out = r.text
+    else:
+        out = await _gh_run(["gh", "pr", "diff", str(number), "--repo", repo])
     if len(out) > max_bytes:
         return out[:max_bytes] + f"\n... [잘림 — {len(out)} bytes 중 {max_bytes}]\n"
     return out
 
 
 async def pr_files(repo: str, number: int) -> list[dict]:
-    """PR 변경 파일 메타 — additions / deletions / path."""
-    out = await _run([
-        "gh", "pr", "view", str(number), "--repo", repo,
-        "--json", "files",
+    if _use_http(repo):
+        data = await _get_json(
+            repo, f"/repos/{repo}/pulls/{number}/files",
+            params={"per_page": 100},
+        )
+        return [
+            {
+                "path": f.get("filename", ""),
+                "additions": f.get("additions", 0),
+                "deletions": f.get("deletions", 0),
+                "status": f.get("status", ""),
+            }
+            for f in data
+        ]
+    out = await _gh_run([
+        "gh", "pr", "view", str(number), "--repo", repo, "--json", "files",
     ])
     return json.loads(out).get("files", [])
 
 
 async def pr_comments(repo: str, number: int, limit: int = 20) -> list[dict]:
-    """PR 의 사람/봇 코멘트들 — reviewer 가 사람 피드백 보게 하는 용도.
-
-    Returns [{author, body, createdAt}, ...] (최신순 → 오래된 순).
-    bot 자신이 단 코멘트도 포함 — 이전 review 결과를 다음 review 가 참고.
-    """
-    out = await _run([
-        "gh", "pr", "view", str(number), "--repo", repo,
-        "--json", "comments",
+    if _use_http(repo):
+        data = await _get_json(
+            repo, f"/repos/{repo}/issues/{number}/comments",
+            params={"per_page": 100},
+        )
+        return [
+            {
+                "author": (c.get("user") or {}).get("login", "?"),
+                "body": c.get("body", "") or "",
+                "createdAt": c.get("created_at", ""),
+            }
+            for c in data[-limit:]
+        ]
+    out = await _gh_run([
+        "gh", "pr", "view", str(number), "--repo", repo, "--json", "comments",
     ])
     raw = json.loads(out).get("comments", []) or []
-    items = []
-    for c in raw[-limit:]:
-        items.append({
+    return [
+        {
             "author": (c.get("author") or {}).get("login", "?"),
             "body": c.get("body", ""),
             "createdAt": c.get("createdAt", ""),
-        })
-    return items
+        }
+        for c in raw[-limit:]
+    ]
 
 
 async def pr_linked_issues(repo: str, number: int) -> list[int]:
     """PR body 에서 'Closes #N' / 'Fixes #N' 추출."""
     pr = await get_pr(repo, number)
-    import re
     pattern = re.compile(r"(?:closes|fixes|resolves)\s+#(\d+)", re.IGNORECASE)
     return [int(m.group(1)) for m in pattern.finditer(pr.body or "")]
 
@@ -312,7 +558,13 @@ async def submit_pr_review(
     body: str,
     event: str = "COMMENT",       # APPROVE | REQUEST_CHANGES | COMMENT
 ) -> None:
-    """정식 GitHub PR review 등록 (단순 comment 가 아닌)."""
+    """정식 PR review 등록."""
+    if _use_http(repo):
+        await _post_json(
+            repo, f"/repos/{repo}/pulls/{number}/reviews",
+            {"body": body, "event": event},
+        )
+        return
     cmd = ["gh", "pr", "review", str(number), "--repo", repo, "--body-file", "-"]
     if event == "APPROVE":
         cmd.append("--approve")
@@ -320,7 +572,7 @@ async def submit_pr_review(
         cmd.append("--request-changes")
     else:
         cmd.append("--comment")
-    await _run(cmd, input_str=body)
+    await _gh_run(cmd, input_str=body)
 
 
 async def create_pr(
@@ -333,20 +585,33 @@ async def create_pr(
     labels: list[str] = (),
     draft: bool = False,
 ) -> PullRequest:
+    if _use_http(repo):
+        payload = {
+            "title": title, "body": body, "head": head, "base": base, "draft": draft,
+        }
+        data = await _post_json(repo, f"/repos/{repo}/pulls", payload)
+        pr = _parse_pr_http(data)
+        if labels:
+            try:
+                await _post_json(
+                    repo, f"/repos/{repo}/issues/{pr.number}/labels",
+                    {"labels": list(labels)},
+                )
+                return await get_pr(repo, pr.number)
+            except Exception as exc:
+                log.warning("gh.create_pr_label_failed", number=pr.number, error=str(exc))
+        return pr
+
     cmd = [
         "gh", "pr", "create",
-        "--repo", repo,
-        "--title", title,
-        "--body", body,
-        "--head", head,
-        "--base", base,
+        "--repo", repo, "--title", title, "--body", body,
+        "--head", head, "--base", base,
     ]
     if draft:
         cmd.append("--draft")
     for lab in labels:
         cmd += ["--label", lab]
-    out = (await _run(cmd)).strip()
-    # gh pr create 마지막 줄에 URL
+    out = (await _gh_run(cmd)).strip()
     url = out.splitlines()[-1].strip()
     number = int(url.rstrip("/").split("/")[-1])
     return await get_pr(repo, number)
@@ -355,19 +620,64 @@ async def create_pr(
 # ── Current user (BOT_USER 식별) ────────────────────────────────────────────
 
 
-async def whoami() -> str:
-    out = (await _run(["gh", "api", "user"])).strip()
-    return json.loads(out)["login"]
+_whoami_cache: Optional[str] = None
+
+
+async def whoami(repo: Optional[str] = None) -> str:
+    """현재 backend 의 user login.
+
+    HTTP backend: PAT 의 user
+    CLI backend: gh auth status 의 user
+    repo 인자 있으면 그에 맞는 backend 사용.
+    """
+    global _whoami_cache
+    if _whoami_cache:
+        return _whoami_cache
+
+    # backend 결정 — repo 있으면 그것 기반, 없으면 cwd 기반
+    use_http = _use_http(repo) if repo else (Path.cwd().resolve().parts.__contains__("dev-private"))
+
+    if use_http:
+        # PAT 찾기 — repo 있으면 그 PAT, 없으면 GH_TOKEN/GITHUB_TOKEN
+        if repo:
+            try:
+                token = _pat_for(repo)
+            except RuntimeError:
+                token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
+        else:
+            token = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_TOKEN")
+        if not token:
+            raise RuntimeError("whoami: HTTP backend 인데 PAT 없음")
+        headers = {
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+            "Authorization": f"Bearer {token}",
+            "User-Agent": "agentic-harness",
+        }
+        async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT) as client:
+            r = await client.get(f"{GITHUB_API_BASE}/user", headers=headers)
+        if r.status_code >= 400:
+            raise RuntimeError(f"whoami → {r.status_code}: {r.text[:300]}")
+        login = r.json().get("login")
+    else:
+        out = (await _gh_run(["gh", "api", "user"])).strip()
+        login = json.loads(out).get("login")
+
+    if not login:
+        raise RuntimeError("whoami: 응답에 login 없음")
+    _whoami_cache = login
+    return login
 
 
 # ── Labels ──────────────────────────────────────────────────────────────────
 
 
 async def list_labels(repo: str) -> list[str]:
-    """현재 repo의 라벨 이름 목록."""
-    out = await _run([
-        "gh", "label", "list", "--repo", repo, "--limit", "200",
-        "--json", "name",
+    if _use_http(repo):
+        data = await _get_json(repo, f"/repos/{repo}/labels", params={"per_page": 100})
+        return [lab["name"] for lab in data]
+    out = await _gh_run([
+        "gh", "label", "list", "--repo", repo, "--limit", "200", "--json", "name",
     ])
     return [lab["name"] for lab in json.loads(out)]
 
@@ -376,42 +686,50 @@ async def ensure_label(
     repo: str, name: str, color: str = "ededed", description: str = ""
 ) -> bool:
     """라벨 없으면 생성. 이미 있으면 skip. 생성 시 True."""
+    if _use_http(repo):
+        payload = {"name": name, "color": color}
+        if description:
+            payload["description"] = description
+        try:
+            await _post_json(repo, f"/repos/{repo}/labels", payload)
+            log.info("gh.label_created", repo=repo, label=name)
+            return True
+        except RuntimeError as exc:
+            if "already_exists" in str(exc).lower() or "already exists" in str(exc).lower():
+                return False
+            raise
+
     try:
-        cmd = [
-            "gh", "label", "create", name,
-            "--repo", repo,
-            "--color", color,
-        ]
+        cmd = ["gh", "label", "create", name, "--repo", repo, "--color", color]
         if description:
             cmd += ["--description", description]
-        await _run(cmd)
+        await _gh_run(cmd)
         log.info("gh.label_created", repo=repo, label=name)
         return True
     except RuntimeError as exc:
-        # gh label create 가 이미 존재 시 stderr 에 "already exists" 출력
         if "already exists" in str(exc).lower():
             return False
         raise
 
 
 # 표준 라벨 정의 — color + description.
-# `ah init-labels` 와 add-task 자동 호출 시 사용.
+# 전체 state machine: ADR-012 (Agent team 재정의) 참조.
 STANDARD_LABELS: list[tuple[str, str, str]] = [
-    # 모두 ah: prefix — GitHub default 라벨과 명확히 구별.
-    ("ah:needs-execution", "fbca04", "code-executor 대기 (issue)"),
-    ("ah:needs-review",    "0e8a16", "code-reviewer 대기 (PR)"),
-    ("ah:awaiting-human",  "1d76db", "사람 결정 대기 (merge / ADR 포함, PR)"),
+    ("ah:needs-execution", "fbca04", "developer 대기 (issue 신규 또는 PR amend)"),
+    ("ah:needs-review",    "0e8a16", "reviewer 대기 (PR)"),
+    ("ah:in-debate",       "d4c5f9", "developer 가 review 에 반박 중 — 다음 tick reviewer 재평가"),
+    ("ah:needs-critique",  "5319e7", "reviewer 통과 후 critique final gate 대기"),
+    ("ah:awaiting-human",  "1d76db", "사람 결정 대기 (merge / escalation)"),
     ("ah:in-progress",     "c5def5", "agent 가 처리 중 (락 — issue/PR)"),
+    ("ah:sot-pending",     "fef2c0", "merged PR — PO mode B 가 SoT 갱신 필요"),
+    ("ah:sot-done",        "e6e6e6", "merged PR — PO mode B 가 처리 완료 (skip)"),
 ]
-# Note:
-# - agent:po/executor/reviewer/sot-manager 는 PR body 푸터 / review 헤더로 충분.
-# - need_adr 은 awaiting-human 에 통합. ADR 필요 여부는 reviewer comment 헤더에 표시.
 
 
 async def ensure_standard_labels(repo: str) -> dict:
     """STANDARD_LABELS 모두 ensure. 생성/skip 통계 반환."""
     existing = set(await list_labels(repo))
-    stats = {"created": [], "existed": []}
+    stats: dict = {"created": [], "existed": []}
     for name, color, desc in STANDARD_LABELS:
         if name in existing:
             stats["existed"].append(name)
@@ -428,23 +746,56 @@ async def ensure_standard_labels(repo: str) -> dict:
 
 
 async def recent_prs(repo: str, limit: int = 20) -> list[dict]:
-    """최근 PR — title / state / merged / labels / url 만. (PR 상세 안 가져옴)"""
+    if _use_http(repo):
+        data = await _get_json(
+            repo, f"/repos/{repo}/pulls",
+            params={"state": "all", "sort": "created", "direction": "desc",
+                    "per_page": min(limit, 100)},
+        )
+        return [
+            {
+                "number": p["number"],
+                "title": p.get("title", ""),
+                "state": (p.get("state") or "").lower(),
+                "labels": [l["name"] for l in p.get("labels", []) if isinstance(l, dict)],
+                "url": p.get("html_url", ""),
+                "mergedAt": p.get("merged_at"),
+                "createdAt": p.get("created_at"),
+            }
+            for p in data[:limit]
+        ]
+
     cmd = [
-        "gh", "pr", "list",
-        "--repo", repo,
-        "--state", "all",
-        "--limit", str(limit),
+        "gh", "pr", "list", "--repo", repo,
+        "--state", "all", "--limit", str(limit),
         "--json", "number,title,state,labels,url,mergedAt,createdAt",
     ]
-    return json.loads(await _run(cmd))
+    return json.loads(await _gh_run(cmd))
 
 
 async def recent_issues(repo: str, limit: int = 20) -> list[dict]:
+    if _use_http(repo):
+        data = await _get_json(
+            repo, f"/repos/{repo}/issues",
+            params={"state": "all", "sort": "created", "direction": "desc",
+                    "per_page": min(limit, 100)},
+        )
+        issues_only = [i for i in data if "pull_request" not in i]
+        return [
+            {
+                "number": i["number"],
+                "title": i.get("title", ""),
+                "state": (i.get("state") or "").lower(),
+                "labels": [l["name"] for l in i.get("labels", []) if isinstance(l, dict)],
+                "url": i.get("html_url", ""),
+                "createdAt": i.get("created_at"),
+            }
+            for i in issues_only[:limit]
+        ]
+
     cmd = [
-        "gh", "issue", "list",
-        "--repo", repo,
-        "--state", "all",
-        "--limit", str(limit),
+        "gh", "issue", "list", "--repo", repo,
+        "--state", "all", "--limit", str(limit),
         "--json", "number,title,state,labels,url,createdAt",
     ]
-    return json.loads(await _run(cmd))
+    return json.loads(await _gh_run(cmd))
