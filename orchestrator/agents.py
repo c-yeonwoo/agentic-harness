@@ -367,10 +367,15 @@ async def run_developer_amend(
 
         if result.ok:
             # PR 은 이미 존재 — 라벨만 swap + 성공 코멘트
+            # debate cycle: ah:in-debate 도 같이 제거 (이제 reviewer 가 재평가 차례)
             try:
                 await gh.remove_label(repo, "pr", pr.number, "ah:needs-execution")
             except Exception as exc:
                 log.warning("developer.amend.remove_label_failed", error=str(exc))
+            try:
+                await gh.remove_label(repo, "pr", pr.number, "ah:in-debate")
+            except Exception:
+                pass  # 없어도 OK
             try:
                 await gh.add_label(repo, "pr", pr.number, "ah:needs-review")
             except Exception as exc:
@@ -572,9 +577,11 @@ async def run_code_reviewer(
 ) -> bool:
     """`ah:needs-review` PR 1개 review → comment + 라벨 전이.
 
-    verdict 별 처리:
-      - approve / concerns_noted → `ah:awaiting-human`
-      - request_changes         → `ah:needs-execution` (amend 큐, PR 유지)
+    verdict 별 처리 (ADR-012 debate cycle):
+      - approve                                → `ah:awaiting-human` (사람 merge)
+      - request_changes / concerns_noted       → `ah:in-debate` + `ah:needs-execution`
+                                                  (developer amend 사이클 — approve 까지 계속)
+      - debate round cap (3회) 도달            → `ah:awaiting-human` (사람 escalation)
 
     HARNESS_MODE / REVIEWER_MODE 로 분기:
       - hermes → llm.call (단일 LLM 호출, 기존 동작)
@@ -709,30 +716,83 @@ async def run_code_reviewer(
             except Exception as exc:
                 log.warning("reviewer.remove_label_failed", error=str(exc))
 
-            if verdict == "request_changes":
+            # verdict 별 라벨 전이 (ADR-012)
+            # approve         → awaiting-human (사람 merge)
+            # 그 외 (concerns_noted / request_changes) → developer 가 approve 받을
+            #   때까지 amend. 단 cap (DEBATE_ROUND_CAP=3) 넘으면 escalate.
+            DEBATE_ROUND_CAP = int(os.environ.get("DEBATE_ROUND_CAP", "3"))
+            DEBATE_MARK = "🔁 **debate round"
+
+            if verdict == "approve":
+                # 최종 게이트 통과 — 사람 merge 결정 대기
+                # in-debate 라벨이 붙어있었다면 제거
                 try:
-                    await gh.add_label(repo, "pr", pr.number, "ah:needs-execution")
-                except Exception as exc:
-                    log.warning("reviewer.add_amend_label_failed",
-                                pr=pr.number, error=str(exc))
-                try:
-                    await gh.comment_pr(repo, pr.number,
-                        "🔁 **code-reviewer 가 request_changes** — 같은 PR 의 branch 에 "
-                        "추가 commit 으로 보강합니다 (developer amend mode).\n\n"
-                        "사람 개입 필요하면 PR 의 `ah:needs-execution` 라벨 떼서 멈출 수 있습니다."
-                    )
-                except Exception as exc:
-                    log.warning("reviewer.amend_comment_failed",
-                                pr=pr.number, error=str(exc))
-            else:
+                    await gh.remove_label(repo, "pr", pr.number, "ah:in-debate")
+                except Exception:
+                    pass
                 try:
                     await gh.add_label(repo, "pr", pr.number, "ah:awaiting-human")
                 except Exception as exc:
                     log.warning("reviewer.add_label_failed", error=str(exc))
+            else:
+                # concerns_noted 또는 request_changes — developer 가 대응해야 함
+                # debate round 카운트 — 기존 "🔁 debate round" 코멘트 갯수
+                debate_round = sum(1 for c in comments if DEBATE_MARK in c["body"]) + 1
+
+                if debate_round > DEBATE_ROUND_CAP:
+                    # cap 도달 — 사람 escalation (critique tie-break 미구현 fallback)
+                    log.warning("reviewer.debate_cap_reached",
+                                pr=pr.number, round=debate_round, cap=DEBATE_ROUND_CAP)
+                    try:
+                        await gh.remove_label(repo, "pr", pr.number, "ah:in-debate")
+                    except Exception:
+                        pass
+                    try:
+                        await gh.add_label(repo, "pr", pr.number, "ah:awaiting-human")
+                    except Exception as exc:
+                        log.warning("reviewer.cap_label_failed",
+                                    pr=pr.number, error=str(exc))
+                    try:
+                        await gh.comment_pr(repo, pr.number,
+                            f"🛑 **debate round cap ({DEBATE_ROUND_CAP}) 도달 — 사람 결정 대기**\n\n"
+                            f"reviewer 가 {debate_round-1}회 연속으로 approve 안 함. "
+                            f"자동 amend 중단. 사람이 PR 직접 검토 후 결정.\n\n"
+                            f"이어서 자동 진행하려면 `ah:awaiting-human` → `ah:in-debate` + `ah:needs-execution` 로 라벨 교체."
+                        )
+                    except Exception as exc:
+                        log.warning("reviewer.cap_comment_failed",
+                                    pr=pr.number, error=str(exc))
+                else:
+                    # debate 사이클 진행 — developer amend 큐로
+                    try:
+                        await gh.add_label(repo, "pr", pr.number, "ah:in-debate")
+                    except Exception as exc:
+                        log.warning("reviewer.add_debate_label_failed",
+                                    pr=pr.number, error=str(exc))
+                    try:
+                        await gh.add_label(repo, "pr", pr.number, "ah:needs-execution")
+                    except Exception as exc:
+                        log.warning("reviewer.add_amend_label_failed",
+                                    pr=pr.number, error=str(exc))
+                    verdict_kor = {
+                        "request_changes": "request_changes (🔴)",
+                        "concerns_noted": "concerns_noted (🟡)",
+                    }.get(verdict, verdict)
+                    try:
+                        await gh.comment_pr(repo, pr.number,
+                            f"{DEBATE_MARK} {debate_round}/{DEBATE_ROUND_CAP}** "
+                            f"— reviewer verdict: **{verdict_kor}**\n\n"
+                            f"developer 가 amend mode 로 위 review 의견 반영 예정. "
+                            f"approve 나올 때까지 이 사이클 반복 (cap {DEBATE_ROUND_CAP}회).\n\n"
+                            f"사람 개입 필요하면 PR 의 `ah:needs-execution` 라벨 뗼어서 멈출 수 있음."
+                        )
+                    except Exception as exc:
+                        log.warning("reviewer.debate_comment_failed",
+                                    pr=pr.number, error=str(exc))
 
             log.info("reviewer.done", pr=pr.number, verdict=verdict,
                      needs_adr=bool(review.get("needs_adr")),
-                     retriggered=(verdict == "request_changes"),
+                     in_debate=(verdict != "approve"),
                      cost=round(call_info.cost_usd, 4))
             return True
         except Exception as exc:
