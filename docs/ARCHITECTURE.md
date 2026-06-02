@@ -78,25 +78,34 @@
   4. 워커 script 호출
 - **모델**: LLM 없음 (단순 bash script — Hermes cron `--no-agent`)
 
-### 2.3 `code-executor` (Python ReAct)
+### 2.3 `code-executor` (Runner 추상화 — Hermes ReAct 또는 Local claude -p)
 
 - **Input**: issue 1건 (신규 모드) 또는 PR 1건 (amend 모드)
 - **Output**: 새 PR (`ah:needs-review`) 또는 기존 PR 에 추가 commit + 라벨 swap
-- **책임**:
+- **공통 (agents.py)**:
+  1. 락 획득 (`ah:in-progress`)
+  2. SoT discover + user prompt 빌드
+  3. `ExecutionContext` 만들어 `Runner.execute()` 호출 (mode 분기는 `HARNESS_MODE` env)
+  4. `ExecutionResult` 의 `ok` / `error_kind` 에 따라 PR 생성 + 라벨 전이
+  5. 락 해제
+- **Hermes mode (`ApiRunner`, default)**:
   1. SoT inject (system prompt 의 cache 영역)
   2. ReAct tool-loop — `list_files` / `read_file` / `search_text` / `submit_plan`
-  3. plan 정규화 (`_normalize_plan` — Haiku 의 stringified JSON 복구)
-  4. worktree 생성:
-     - 신규: `origin/main` 에서 새 branch
-     - amend: `origin/<pr.head_ref>` 에서 same branch
-  5. plan 의 file action 적용 (`create` / `edit` / `replace` / `delete`)
-     - edit 의 `old_str` 1회 매칭 검증 (fuzzy fallback)
-  6. commit + push
-  7. PR 생성 (신규) 또는 amend (기존 PR 라벨 swap)
-- **에러 처리**:
-  - `EditApplyError` → ❌ 코멘트 + `ah:needs-execution` 재부착 (retry cap=1 검사 후)
-  - 그 외 → ❌ 코멘트 + `ah:awaiting-human`
-- **모델**: 코드 reasoning 강 모델 (sonnet / gpt-5)
+  3. plan 정규화 (`_normalize_plan`)
+  4. `apply_plan_and_push` — worktree + create/edit/replace/delete + edit fuzzy fallback
+- **Local mode (`LocalClaudeRunner`, ADR-011)**:
+  1. `prepare_worktree` (신규: base 에서 / amend: origin/<head_ref> 에서)
+  2. `claude -p --output-format json --permission-mode bypassPermissions` spawn
+     (cwd = worktree, `--disallowedTools` 로 git/gh 쓰기 차단)
+  3. claude 가 Read/Edit/Write/Bash 로 직접 편집 + 최종 JSON 출력
+  4. `stage_commit_push_all` — worktree 의 모든 변경을 1 commit + push
+  5. `cleanup_worktree`
+- **에러 처리** (공통):
+  - `edit_apply` (Hermes 만) → ❌ 코멘트 + `ah:needs-execution` 재부착 (cap=1)
+  - `no_changes` (Local) → ❌ 코멘트 + awaiting-human (모델이 작업 거부)
+  - `no_plan` / `crashed` → ❌ 코멘트 + 호출자가 awaiting-human
+- **모델**: Hermes 는 EXECUTOR_MODEL env (codex / sonnet). Local 은 claude -p 의
+  현 user OAuth 세션 (`LOCAL_CLAUDE_MODEL` 로 override 가능)
 
 ### 2.4 `code-reviewer` (Python single-call)
 
@@ -159,27 +168,42 @@ Tier 4 (도메인) — <repo>/docs/*.md
 
 ---
 
-## 4. Hermes 통합
+## 4. 트랙별 진입점
 
-### 4.1 Hermes 가 맡는 것
+agentic-harness 는 두 가지 트랙으로 동작 가능 — 같은 라벨 state machine /
+SoT / GitHub flow 위에서, cron 트리거와 LLM 진입점만 다름.
 
-- **cron schedule** — `hermes cron create 'every 5m' --no-agent --script foo.sh`
-- **skill 등록** — `~/.hermes/skills/<category>/<name>/SKILL.md` (frontmatter + body)
-- **chat entry-point** — `hermes chat -s <skill> -q "<query>"` (사용자 진입)
-- **gateway lifecycle** — `hermes gateway install` 로 launchd 등록
-- **delivery** — telegram / slack / discord alarm (Phase F)
-- **kanban** (선택) — task queue UI (Phase C 시 활용 가능)
+### 4.1 local 트랙 (default, ADR-011)
 
-### 4.2 agent-harness 가 맡는 것
+- **cron**: macOS `launchd` LaunchAgent (`~/Library/LaunchAgents/com.agentic-harness.<slug>.plist`)
+  - `StartInterval=300` (5분) — `ah run --once --repo X --cwd Y --mode local`
+  - 설치: `bash scripts/setup-local-launchd.sh <repo>`
+  - 로그: `~/Library/Logs/agentic-harness/<slug>.{out,err}`
+- **LLM**: `claude -p` 헤드리스 — user OAuth/subscription, opus 4.7
+- **PO 진입**: `ah add-task "<자연어>"` (또는 claude code 안에서 slash command)
+- **PR body 생성**: `/pr-description` 스킬 (claude code 의 ~/.claude/commands/pr-description.md)
+- **불필요**: `.hermes/` 디렉토리, Hermes gateway, OPENAI/ANTHROPIC API key
 
-- **LLM tool-loop (ReAct)** — `claude.py:call_with_tools` (Phase B 후 `llm.py`)
-- **plan 정규화 + 검증** — `_normalize_plan`
-- **git worktree + edit + push** — `git_apply.py`
+### 4.2 hermes 트랙 (API 모드)
+
+- **cron**: Hermes (`hermes cron create 'every 5m' --no-agent --script foo.sh`)
+- **dispatcher**: `palette-pm.sh` → `palette-executor.sh <N>` / `palette-reviewer.sh <N>`
+- **LLM**: OpenAI (gpt-5.3-codex) 또는 Anthropic (claude-*) API
+- **PO 진입**: `hermes chat -s palette-po "<자연어>"` (Hermes skill)
+- **PR body 생성**: executor 의 plan JSON 의 `pr_body` 필드
+- **필요**: `.hermes/` 디렉토리, Hermes gateway, API key
+
+### 4.3 공통 — agentic-harness 가 맡는 책임
+
+- **Runner 추상화 (`runners/`)** — local / hermes 분기점
+- **LLM tool-loop (ReAct)** — hermes 전용 (`llm.py`, `code_tools.py`, `_normalize_plan`)
+- **claude -p spawn** — local 전용 (`runners/local_claude.py`)
+- **git worktree + edit + push** — `git_apply.py` (두 모드 공유)
 - **GitHub label / PR / Closes #N** — `gh.py`
 - **SoT 발견 + caching** — `source_of_truth.py`
-- **cost 추적 + model 선택** — `_PRICING`
+- **cost 추적 + model 선택** — `_PRICING` (hermes) / claude envelope (local)
 
-→ Hermes 죽으면 `ah run` daemon 으로 fallback (poller.py).
+→ 두 트랙은 peer. Hermes 가 죽어도 local 트랙 영향 X, 반대도 마찬가지.
 
 ---
 

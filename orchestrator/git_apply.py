@@ -10,6 +10,14 @@ LLM 이 만든 plan.commits[i].files[j] 는:
   3. git add + commit
   4. push origin branch
   5. worktree cleanup
+
+로컬 클로드 모드 (Runner 추상화) 를 위해 worktree prep/cleanup 과
+plan apply 를 분리:
+
+  prepare_worktree(...)       — base/amend 에서 worktree 분기
+  stage_commit_push_all(...)  — worktree 안 모든 변경을 1 commit 으로 push
+  cleanup_worktree(...)       — worktree 제거
+  apply_plan_and_push(...)    — 위 셋 + plan apply 의 composition (Hermes 백compat)
 """
 from __future__ import annotations
 
@@ -17,6 +25,7 @@ import asyncio
 import shutil
 import tempfile
 import uuid
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -40,6 +49,17 @@ class EditApplyError(RuntimeError):
         self.message = message
         self.old_str_head = old_str_head
         super().__init__(f"{path} edits[{edit_idx}]: {message}")
+
+
+@dataclass
+class WorktreeHandle:
+    """prepare_worktree 결과 — Runner / commit / cleanup 단계 모두 이걸로 전달."""
+    path: Path                  # worktree 디렉토리 (claude -p 의 cwd / --add-dir)
+    branch: str                 # PR 식별용 branch 이름 (신규 = plan.branch_name, amend = existing_branch)
+    base: str                   # base 브랜치 (e.g. main)
+    push_branch: str            # 실제 push target (신규 = branch, amend = existing_branch)
+    existing_branch: Optional[str]  # amend 모드일 때만 set
+    work_branch: str            # worktree 내부의 로컬 branch 이름 (amend 는 임시 ah-amend-xxx)
 
 
 async def _git(cwd: Path, *args: str, input_str: Optional[str] = None) -> str:
@@ -173,31 +193,38 @@ def _safe_path(root: Path, rel: str) -> Path:
     return target
 
 
-async def apply_plan_and_push(
+# ── 공용 worktree 헬퍼 — Runner 추상화에서 재사용 ─────────────────────────────
+
+
+def _validate_branch_name(branch: str) -> None:
+    allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_/.")
+    if not all(c in allowed for c in branch):
+        raise RuntimeError(f"invalid branch_name (영문/숫자/-_/. 만 허용): {branch!r}")
+
+
+async def prepare_worktree(
     *,
     repo_cwd: Path,
-    plan: dict,
-    issue_number: int,
+    branch_name: Optional[str] = None,
     existing_branch: Optional[str] = None,
-) -> dict:
-    """plan 받아 worktree + content write + commit + push.
+) -> WorktreeHandle:
+    """worktree 분기 — Runner / agents 가 공용으로 사용.
 
-    existing_branch:
-      None        — 신규: base 에서 새 branch 따고 새 PR 만들 준비
-      "<branch>"  — amend: 기존 branch 를 origin/<branch> 에서 체크아웃,
-                    plan.branch_name 무시. 추가 commit 후 같은 branch 로 push.
+    신규 모드 (existing_branch=None):
+      base = origin 의 default branch
+      branch_name 에서 새 branch 생성, worktree 의 HEAD 도 이 branch.
 
-    Returns: {"branch": str, "base": str, "commits_applied": int, "files_changed": int}
+    amend 모드 (existing_branch 지정):
+      origin/<existing_branch> 에서 임시 work_branch (ah-amend-xxx) 로 분기.
+      branch_name 무시. push 단계는 HEAD:<existing_branch> 로.
     """
     if not (repo_cwd / ".git").exists():
         raise RuntimeError(f"not a git repo: {repo_cwd}")
 
     base = await _detect_default_branch(repo_cwd)
     tmp_root = Path(tempfile.gettempdir()) / f"ah-{uuid.uuid4().hex[:8]}"
-    push_branch = ""
 
     if existing_branch:
-        # ── amend mode — 기존 branch 의 최신 head 에서 worktree 분기 ──
         branch = existing_branch.strip()
         push_branch = branch
         work_branch = f"ah-amend-{uuid.uuid4().hex[:8]}"
@@ -209,7 +236,6 @@ async def apply_plan_and_push(
                 await _git(repo_cwd, "worktree", "prune")
             except RuntimeError:
                 pass
-            # 기존 branch 와 다른 임시 branch로 worktree 생성 (현재 checkout branch 충돌 회피)
             await _git(repo_cwd, "worktree", "add", "-b", work_branch,
                        str(tmp_root), f"origin/{branch}")
         except RuntimeError:
@@ -217,14 +243,12 @@ async def apply_plan_and_push(
                 shutil.rmtree(tmp_root, ignore_errors=True)
             raise
     else:
-        # ── 신규 mode — base 에서 새 branch ──
-        branch = plan.get("branch_name", "").strip()
-        push_branch = branch
+        branch = (branch_name or "").strip()
         if not branch:
-            raise RuntimeError("plan.branch_name 비어있음")
-        allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_/.")
-        if not all(c in allowed for c in branch):
-            raise RuntimeError(f"invalid branch_name (영문/숫자/-_/. 만 허용): {branch!r}")
+            raise RuntimeError("branch_name 비어있음 (신규 모드)")
+        _validate_branch_name(branch)
+        push_branch = branch
+        work_branch = branch
 
         log.info("apply.worktree_create", path=str(tmp_root), branch=branch,
                  base=base, mode="new")
@@ -246,6 +270,180 @@ async def apply_plan_and_push(
                 shutil.rmtree(tmp_root, ignore_errors=True)
             raise
 
+    return WorktreeHandle(
+        path=tmp_root,
+        branch=branch,
+        base=base,
+        push_branch=push_branch,
+        existing_branch=existing_branch,
+        work_branch=work_branch,
+    )
+
+
+async def cleanup_worktree(*, repo_cwd: Path, wt: WorktreeHandle) -> None:
+    """worktree 제거. 실패해도 디렉토리는 강제 정리."""
+    try:
+        await _git(repo_cwd, "worktree", "remove", "--force", str(wt.path))
+    except RuntimeError as exc:
+        log.warning("apply.worktree_cleanup_failed", error=str(exc))
+        if wt.path.exists():
+            shutil.rmtree(wt.path, ignore_errors=True)
+
+
+async def detect_worktree_changes(wt: WorktreeHandle) -> dict:
+    """worktree 의 변경 파일 통계. 로컬 모드 Runner 가 claude 실행 후 호출.
+
+    Returns: {"files_changed": int, "paths": [str, ...], "porcelain": str}
+    """
+    out = await _git(wt.path, "status", "--porcelain")
+    lines = [ln for ln in out.splitlines() if ln.strip()]
+    paths = []
+    for ln in lines:
+        # 'XY path' 또는 'XY orig -> new' (rename)
+        rest = ln[3:] if len(ln) > 3 else ""
+        if " -> " in rest:
+            rest = rest.split(" -> ", 1)[1]
+        paths.append(rest)
+    return {"files_changed": len(lines), "paths": paths, "porcelain": out}
+
+
+async def stage_commit_push_all(
+    *,
+    repo_cwd: Path,
+    wt: WorktreeHandle,
+    commit_message: str,
+) -> dict:
+    """worktree 의 모든 변경을 1 commit 으로 stage / commit / push.
+
+    로컬 클로드 모드용 — claude -p 가 worktree 안 파일을 자유롭게 편집한 뒤
+    harness 가 호출. 변경 없으면 RuntimeError.
+
+    Returns: {"branch": str, "base": str, "commits_applied": 1, "files_changed": int}
+    """
+    changes = await detect_worktree_changes(wt)
+    if changes["files_changed"] == 0:
+        raise RuntimeError(
+            "worktree 에 변경 없음 — Runner 가 실제 편집을 안 했거나 다른 경로에 작성됨"
+        )
+
+    await _git(wt.path, "add", "-A")
+    try:
+        await _git(wt.path, "commit", "-m", commit_message)
+    except RuntimeError as exc:
+        if "nothing to commit" in str(exc):
+            raise RuntimeError("git commit: nothing to commit (staging 후에도 변경 없음)")
+        raise
+
+    if wt.existing_branch:
+        await _git(wt.path, "push", "origin", f"HEAD:{wt.push_branch}")
+    else:
+        await _git(wt.path, "push", "-u", "origin", wt.push_branch)
+
+    return {
+        "branch": wt.branch,
+        "base": wt.base,
+        "commits_applied": 1,
+        "files_changed": changes["files_changed"],
+    }
+
+
+# ── plan 기반 apply (Hermes 모드 — 기존 동작 유지) ───────────────────────────
+
+
+def _apply_file_action(wt_root: Path, f: dict) -> bool:
+    """plan.commits[].files[] 1개 적용. 변경 있으면 True.
+
+    EditApplyError 는 그대로 propagate.
+    """
+    path = (f.get("path") or "").strip()
+    action = (f.get("action") or "replace").strip().lower()
+    content = f.get("content", "")
+    if not path:
+        return False
+
+    target = _safe_path(wt_root, path)
+
+    if action == "delete":
+        if target.exists():
+            target.unlink()
+            log.info("apply.file_deleted", path=path)
+            return True
+        return False
+    elif action in ("create", "replace"):
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text(content, encoding="utf-8")
+        log.info("apply.file_written", path=path, bytes=len(content), action=action)
+        return True
+    elif action == "edit":
+        if not target.exists():
+            raise RuntimeError(f"edit action: 파일 없음 — {path}")
+        text = target.read_text(encoding="utf-8")
+        edits = f.get("edits") or []
+        if not edits:
+            log.warning("apply.edit_no_edits", path=path)
+            return False
+        for ei, edit in enumerate(edits, 1):
+            old = edit.get("old_str", "")
+            new = edit.get("new_str", "")
+            if not old:
+                raise RuntimeError(
+                    f"edit action: edits[{ei}].old_str 비어있음 — {path}"
+                )
+            count = text.count(old)
+            if count == 0:
+                text2, matched = _fuzzy_replace(text, old, new)
+                if matched:
+                    text = text2
+                    log.info("apply.edit_fuzzy_match", path=path, idx=ei)
+                    continue
+
+                text3, matched2 = _anchor_replace(text, old, new)
+                if matched2:
+                    text = text3
+                    log.info("apply.edit_anchor_match", path=path, idx=ei)
+                    continue
+
+                raise EditApplyError(
+                    path=path, edit_idx=ei,
+                    message="old_str 매칭 0회 (exact/fuzzy/anchor 모두 실패) — read_file 로 현재 본문 재확인 후 더 긴 unique context 로 plan 필요",
+                    old_str_head=old[:200],
+                )
+            if count > 1:
+                raise EditApplyError(
+                    path=path, edit_idx=ei,
+                    message=f"old_str 매칭 {count}회 (1회여야) — 더 많은 context 추가해 unique 하게",
+                    old_str_head=old[:200],
+                )
+            text = text.replace(old, new, 1)
+        target.write_text(text, encoding="utf-8")
+        log.info("apply.file_edited", path=path, edits=len(edits))
+        return True
+    else:
+        log.warning("apply.unknown_action", path=path, action=action)
+        return False
+
+
+async def apply_plan_and_push(
+    *,
+    repo_cwd: Path,
+    plan: dict,
+    issue_number: int,
+    existing_branch: Optional[str] = None,
+) -> dict:
+    """plan 받아 worktree + content write + commit + push.
+
+    existing_branch:
+      None        — 신규: base 에서 새 branch 따고 새 PR 만들 준비
+      "<branch>"  — amend: 기존 branch 를 origin/<branch> 에서 체크아웃,
+                    plan.branch_name 무시. 추가 commit 후 같은 branch 로 push.
+
+    Returns: {"branch": str, "base": str, "commits_applied": int, "files_changed": int}
+    """
+    wt = await prepare_worktree(
+        repo_cwd=repo_cwd,
+        branch_name=plan.get("branch_name") if not existing_branch else None,
+        existing_branch=existing_branch,
+    )
     try:
         commits = plan.get("commits") or []
         if not commits:
@@ -264,80 +462,14 @@ async def apply_plan_and_push(
                 continue
 
             for f in files:
-                path = (f.get("path") or "").strip()
-                action = (f.get("action") or "replace").strip().lower()
-                content = f.get("content", "")
-                if not path:
-                    continue
-
-                target = _safe_path(tmp_root, path)
-
-                if action == "delete":
-                    if target.exists():
-                        target.unlink()
-                        log.info("apply.file_deleted", path=path)
-                elif action in ("create", "replace"):
-                    target.parent.mkdir(parents=True, exist_ok=True)
-                    target.write_text(content, encoding="utf-8")
-                    log.info("apply.file_written", path=path,
-                             bytes=len(content), action=action)
-                elif action == "edit":
-                    # 부분 변경 — old_str / new_str 쌍을 순서대로 적용.
-                    # old_str 이 정확히 한 번 등장해야 — 안 그러면 실패 (안전).
-                    if not target.exists():
-                        raise RuntimeError(f"edit action: 파일 없음 — {path}")
-                    text = target.read_text(encoding="utf-8")
-                    edits = f.get("edits") or []
-                    if not edits:
-                        log.warning("apply.edit_no_edits", path=path)
-                        continue
-                    for ei, edit in enumerate(edits, 1):
-                        old = edit.get("old_str", "")
-                        new = edit.get("new_str", "")
-                        if not old:
-                            raise RuntimeError(
-                                f"edit action: edits[{ei}].old_str 비어있음 — {path}"
-                            )
-                        count = text.count(old)
-                        if count == 0:
-                            # 1) whitespace 정규화
-                            text2, matched = _fuzzy_replace(text, old, new)
-                            if matched:
-                                text = text2
-                                log.info("apply.edit_fuzzy_match", path=path, idx=ei)
-                                continue
-
-                            # 2) anchor(첫/끝 유의미 line) 기반 보수적 fallback
-                            text3, matched2 = _anchor_replace(text, old, new)
-                            if matched2:
-                                text = text3
-                                log.info("apply.edit_anchor_match", path=path, idx=ei)
-                                continue
-
-                            raise EditApplyError(
-                                path=path, edit_idx=ei,
-                                message="old_str 매칭 0회 (exact/fuzzy/anchor 모두 실패) — read_file 로 현재 본문 재확인 후 더 긴 unique context 로 plan 필요",
-                                old_str_head=old[:200],
-                            )
-                        if count > 1:
-                            raise EditApplyError(
-                                path=path, edit_idx=ei,
-                                message=f"old_str 매칭 {count}회 (1회여야) — 더 많은 context 추가해 unique 하게",
-                                old_str_head=old[:200],
-                            )
-                        text = text.replace(old, new, 1)
-                    target.write_text(text, encoding="utf-8")
-                    log.info("apply.file_edited", path=path, edits=len(edits))
-                else:
-                    log.warning("apply.unknown_action", path=path, action=action)
-                    continue
-                total_files += 1
+                if _apply_file_action(wt.path, f):
+                    total_files += 1
 
             # stage + commit
-            await _git(tmp_root, "add", "-A")
+            await _git(wt.path, "add", "-A")
             msg = commit.get("message") or f"[#{issue_number}] auto commit {ci}"
             try:
-                await _git(tmp_root, "commit", "-m", msg)
+                await _git(wt.path, "commit", "-m", msg)
             except RuntimeError as exc:
                 if "nothing to commit" in str(exc):
                     log.warning("apply.nothing_to_commit", index=ci)
@@ -352,21 +484,15 @@ async def apply_plan_and_push(
 
         # push
         if existing_branch:
-            # amend: 임시 worktree branch HEAD 를 원본 branch 로 직접 push
-            await _git(tmp_root, "push", "origin", f"HEAD:{push_branch}")
+            await _git(wt.path, "push", "origin", f"HEAD:{wt.push_branch}")
         else:
-            await _git(tmp_root, "push", "-u", "origin", push_branch)
+            await _git(wt.path, "push", "-u", "origin", wt.push_branch)
 
         return {
-            "branch": branch,
-            "base": base,
+            "branch": wt.branch,
+            "base": wt.base,
             "commits_applied": applied,
             "files_changed": total_files,
         }
     finally:
-        try:
-            await _git(repo_cwd, "worktree", "remove", "--force", str(tmp_root))
-        except RuntimeError as exc:
-            log.warning("apply.worktree_cleanup_failed", error=str(exc))
-            if tmp_root.exists():
-                shutil.rmtree(tmp_root, ignore_errors=True)
+        await cleanup_worktree(repo_cwd=repo_cwd, wt=wt)

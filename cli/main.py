@@ -63,21 +63,32 @@ def add_task(
     description: str = typer.Argument(..., help="task 설명 (자유 텍스트, 한국어 OK)"),
     repo: Optional[str] = typer.Option(None, "--repo", "-r",
                                        help="bucketplace/lore. 미지정 시 cwd git remote"),
+    cwd: Optional[Path] = typer.Option(None, "--cwd", "-c",
+                                       help="repo 로컬 경로 (PO 가 SoT 읽음). 기본 ~/dev-private/<repo_name>"),
+    raw: bool = typer.Option(False, "--raw",
+                             help="PO 안 거치고 description 그대로 raw issue 생성"),
     title: Optional[str] = typer.Option(None, "--title", "-t",
-                                        help="issue 제목 (없으면 description 첫 줄)"),
+                                        help="(--raw 시) issue 제목. 없으면 description 첫 줄"),
     label: list[str] = typer.Option(["ah:needs-execution"], "--label", "-l",
-                                     help="기본 ah:needs-execution. 추가 라벨 가능"),
+                                     help="(--raw 시) 라벨. 기본 ah:needs-execution"),
+    dry_run: bool = typer.Option(False, "--dry-run",
+                                 help="PO 결과만 출력하고 issue 안 만들기"),
 ) -> None:
-    """task → github issue 생성 + `ah:needs-execution` 라벨.
+    """task → PO 가 SoT 보고 1~N 개 issue 로 분할 생성.
 
-    PO agent 는 별도 (claude-code 슬래시 커맨드) — 이 CLI 는 단순 진입점.
+    --raw 옵션 시 PO 안 거치고 description 그대로 issue 1개 만들기 (기존 동작).
     """
-    asyncio.run(_add_task_impl(description, repo, title, list(label)))
+    asyncio.run(_add_task_impl(
+        description=description, repo=repo, cwd=cwd, raw=raw,
+        title=title, labels=list(label), dry_run=dry_run,
+    ))
 
 
-async def _add_task_impl(description: str, repo: Optional[str],
-                         title: Optional[str], labels: list[str]) -> None:
-    from orchestrator.source_of_truth import _parse_git_remote
+async def _add_task_impl(*, description: str, repo: Optional[str],
+                         cwd: Optional[Path], raw: bool,
+                         title: Optional[str], labels: list[str],
+                         dry_run: bool) -> None:
+    from orchestrator.source_of_truth import _parse_git_remote, discover
     if repo is None:
         repo = _parse_git_remote(Path.cwd())
         if not repo:
@@ -85,29 +96,88 @@ async def _add_task_impl(description: str, repo: Optional[str],
                       hint="cwd 가 git repo 아님 — --repo 옵션 지정")
             sys.exit(2)
 
-    # 표준 라벨 없으면 자동 생성 — 첫 사용 편의
-    try:
-        stats = await gh.ensure_standard_labels(repo)
-        if stats["created"]:
-            log.info("add-task.labels_created", repo=repo, labels=stats["created"])
-    except Exception as exc:
-        log.warning("add-task.labels_ensure_failed", error=str(exc))
+    # raw 경로 — 기존 동작 (description → issue 1개)
+    if raw:
+        try:
+            stats = await gh.ensure_standard_labels(repo)
+            if stats["created"]:
+                log.info("add-task.labels_created", repo=repo, labels=stats["created"])
+        except Exception as exc:
+            log.warning("add-task.labels_ensure_failed", error=str(exc))
 
-    if title is None:
-        title = description.splitlines()[0].strip()[:80]
+        if title is None:
+            title = description.splitlines()[0].strip()[:80]
+        body = description.rstrip() + "\n\n---\n_Created via_ `ah add-task --raw`"
+        try:
+            issue = await gh.create_issue(repo, title=title, body=body, labels=labels)
+        except RuntimeError as exc:
+            log.error("add-task.failed", error=str(exc))
+            sys.exit(1)
+        print(f"\n✓ Issue 생성됨 (raw): #{issue.number}")
+        print(f"  {issue.url}")
+        print(f"  labels: {', '.join(issue.labels)}")
+        return
 
-    # description 이 title 과 같아도 body 에 그대로 — agent context 확보용
-    body = description.rstrip() + "\n\n---\n_Created via_ `ah add-task`"
+    # PO 경로 — SoT 읽고 1~N issue 분할
+    from orchestrator import agents
 
-    try:
-        issue = await gh.create_issue(repo, title=title, body=body, labels=labels)
-    except RuntimeError as exc:
-        log.error("add-task.failed", error=str(exc))
+    if cwd is None:
+        name = repo.split("/")[-1]
+        for cand in (Path.home() / "dev-private" / name, Path.home() / "dev" / name):
+            if (cand / ".git").exists():
+                cwd = cand
+                break
+        if cwd is None:
+            log.error("add-task.no_cwd",
+                      hint="--cwd 로 repo 로컬 경로 지정. PO 가 SoT 읽으려면 필요")
+            sys.exit(2)
+
+    log.info("add-task.po_mode", repo=repo, cwd=str(cwd), dry_run=dry_run)
+    print(f"\n▶ PO (mode A) 가 SoT 읽고 task 분석 중 …")
+
+    sot = await discover(cwd)
+    result = await agents.run_po_local(
+        repo=repo, user_agenda=description, sot=sot,
+        repo_cwd=cwd, dry_run=dry_run,
+    )
+
+    cost = result.get("cost_usd", 0.0)
+    model = result.get("model", "")
+
+    if not result.get("ok"):
+        print(f"\n❌ PO 실패: {result.get('error', 'unknown')}")
+        if result.get("summary"):
+            print(f"   summary: {result['summary']}")
+        print(f"   cost: ${cost:.4f}")
         sys.exit(1)
 
-    print(f"\n✓ Issue 생성됨: #{issue.number}")
-    print(f"  {issue.url}")
-    print(f"  labels: {', '.join(issue.labels)}")
+    if dry_run:
+        print(f"\n✓ PO dry-run — {len(result.get('issues_preview', []))} 개 issue 후보 (생성 X)")
+        print(f"  summary: {result.get('summary')}")
+        print(f"  split: {result.get('split_rationale')}")
+        for i, it in enumerate(result.get("issues_preview", []), 1):
+            adr_mark = " 🏛" if it.get("needs_adr") else ""
+            print(f"\n  [{i}] {it['title']}{adr_mark}")
+            print(f"      labels: {', '.join(it['labels'])}")
+            print(f"      body length: {len(it['body'])} chars")
+        print(f"\n  cost: ${cost:.4f} · model: {model}")
+        return
+
+    created = result.get("created", [])
+    summary = result.get("summary", "")
+    split_rationale = result.get("split_rationale", "")
+
+    print(f"\n✓ PO — {len([c for c in created if c.get('number')])} 개 issue 생성")
+    print(f"  summary: {summary}")
+    if split_rationale and split_rationale != summary:
+        print(f"  split: {split_rationale}")
+    for c in created:
+        if c.get("number"):
+            print(f"\n  #{c['number']} {c['title']}")
+            print(f"      {c['url']}")
+        else:
+            print(f"\n  ❌ '{c['title']}' 생성 실패: {c.get('error', '?')}")
+    print(f"\n  cost: ${cost:.4f} · model: {model}")
 
 
 # ── run ─────────────────────────────────────────────────────────────────────
@@ -123,6 +193,8 @@ def run(
                                  help="폴링 간격 (초)"),
     once: bool = typer.Option(False, "--once",
                               help="1회 poll 후 종료 (cron / GitHub Actions 용)"),
+    mode: Optional[str] = typer.Option(None, "--mode", "-m",
+                                       help="hermes | local. 미지정 시 HARNESS_MODE env, 그것도 없으면 hermes"),
 ) -> None:
     """orchestrator daemon — `ah:needs-execution` issue 발견 시 code-executor 실행."""
     if cwd is None:
@@ -135,13 +207,17 @@ def run(
                   hint="--cwd 옵션으로 명시")
         sys.exit(2)
 
+    if mode:
+        os.environ["HARNESS_MODE"] = mode.strip().lower()
+        log.info("run.mode_override", mode=os.environ["HARNESS_MODE"])
+
     asyncio.run(_run_impl(repo, cwd, interval, once))
 
 
 async def _run_impl(repo: str, cwd: Path, interval: int, once: bool) -> None:
     try:
         if once:
-            bot_user = await gh.whoami()
+            bot_user = await gh.whoami(repo)
             stats = await poll_once(repo, cwd, bot_user)
             print(f"\n✓ poll once 완료: {stats}")
         else:
