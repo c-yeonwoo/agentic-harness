@@ -59,6 +59,18 @@ def _format_tb(exc: BaseException) -> str:
     return "".join(lines)[-3000:]
 
 
+def _resolve_repo_cwd(repo: str, repo_cwd: Optional[Path]) -> Path:
+    """repo_cwd 가 None 이면 ~/dev-private/<name> 또는 ~/dev/<name> 추론."""
+    if repo_cwd is not None:
+        return repo_cwd
+    name = repo.split("/")[-1]
+    for cand in (Path.home() / "dev-private" / name, Path.home() / "dev" / name):
+        if (cand / ".git").exists():
+            return cand
+    # fallback — 첫 후보 (없어도 cwd 없는 lock 호출 시 그냥 메타 안 씀)
+    return Path.home() / "dev-private" / name
+
+
 def _cost_footer(result_or_call) -> str:
     """ExecutionResult / LlmCall 공통 cost 한 줄."""
     cost = getattr(result_or_call, "cost_usd", 0.0) or 0.0
@@ -106,17 +118,15 @@ async def run_developer(
     repo_cwd: Optional[Path] = None,
 ) -> bool:
     """`ah:needs-execution` issue 1개 → PR + `ah:needs-review`. 락/모드 분기/에러 처리 책임."""
-    if not await lock.acquire(repo, "issue", issue.number, bot_user):
+    cwd = _resolve_repo_cwd(repo, repo_cwd)
+    if not (cwd / ".git").exists():
+        log.error("developer.cwd_not_git", cwd=str(cwd))
+        return False
+    if not await lock.acquire(repo, "issue", issue.number, bot_user, repo_cwd=cwd):
         log.info("developer.lock_skipped", issue=issue.number)
         return False
 
     try:
-        cwd = repo_cwd
-        if cwd is None:
-            name = repo.split("/")[-1]
-            cwd = Path.home() / "dev" / name
-        if not (cwd / ".git").exists():
-            raise RuntimeError(f"repo cwd 가 git repo 아님: {cwd}")
 
         mode = resolve_mode("developer")
         log.info("developer.start", issue=issue.number, mode=mode)
@@ -200,7 +210,7 @@ async def run_developer(
             result=result, mode=mode,
         )
     finally:
-        await lock.release(repo, "issue", issue.number, bot_user)
+        await lock.release(repo, "issue", issue.number, bot_user, repo_cwd=cwd)
 
 
 async def _handle_developer_failure(
@@ -303,17 +313,15 @@ async def run_developer_amend(
     이전 흐름 (PR close + 새 PR) 폐기 — review thread / git history / `Closes #N` 보존.
     Returns True if successful.
     """
-    if not await lock.acquire(repo, "pr", pr.number, bot_user):
+    cwd = _resolve_repo_cwd(repo, repo_cwd)
+    if not (cwd / ".git").exists():
+        log.error("developer.amend.cwd_not_git", cwd=str(cwd))
+        return False
+    if not await lock.acquire(repo, "pr", pr.number, bot_user, repo_cwd=cwd):
         log.info("developer.amend_lock_skipped", pr=pr.number)
         return False
 
     try:
-        cwd = repo_cwd
-        if cwd is None:
-            name = repo.split("/")[-1]
-            cwd = Path.home() / "dev" / name
-        if not (cwd / ".git").exists():
-            raise RuntimeError(f"repo cwd 가 git repo 아님: {cwd}")
 
         # ── PR context 캐시 (ADR-015) ──
         from orchestrator import pr_context as prctx
@@ -455,7 +463,7 @@ async def run_developer_amend(
             result=result, mode=mode,
         )
     finally:
-        await lock.release(repo, "pr", pr.number, bot_user)
+        await lock.release(repo, "pr", pr.number, bot_user, repo_cwd=cwd)
 
 
 # ── back-compat aliases (ADR-012 rename — 다음 release 까지 유지) ─────────────
@@ -654,7 +662,11 @@ async def run_code_reviewer(
     else:
         raise RuntimeError(f"unknown reviewer mode: {mode}")
 
-    if not await lock.acquire(repo, "pr", pr.number, bot_user):
+    cwd_for_lock = _resolve_repo_cwd(repo, repo_cwd)
+    if not (cwd_for_lock / ".git").exists():
+        log.error("reviewer.cwd_not_git", cwd=str(cwd_for_lock))
+        return False
+    if not await lock.acquire(repo, "pr", pr.number, bot_user, repo_cwd=cwd_for_lock):
         log.info("reviewer.lock_skipped", pr=pr.number)
         return False
 
@@ -901,7 +913,7 @@ async def run_code_reviewer(
                 log.warning("reviewer.error_comment_failed", error=str(inner))
             return False
     finally:
-        await lock.release(repo, "pr", pr.number, bot_user)
+        await lock.release(repo, "pr", pr.number, bot_user, repo_cwd=cwd_for_lock)
 
 
 def _format_review_comment(review: dict, call_info: llm.LlmCall) -> str:
