@@ -44,6 +44,8 @@
   ],
   "needs_adr": false,
   "adr_reason": "needs_adr=true 일 때 — ADR 필요한 결정 사항",
+  "sot_impact": "high | medium | low",
+  "sot_impact_reason": "왜 그 영향도인지 1-2 줄 (low 면 빈 문자열 OK)",
   "positives": [
     "잘 한 점 1-2개 (sandwich feedback)"
   ]
@@ -68,6 +70,24 @@
 - 새 외부 의존성 추가
 - 도메인 scope 경계 변경 (다른 도메인 침범)
 - 일반 코드 변경 (component split / refactor / bugfix) — **false**
+
+## sot_impact 판정 (보수적)
+
+- **high** — merge 후 즉시 SoT 갱신 필요
+  - BREAKING change / API contract 변경 / 권한 모델 변경
+  - 새 ADR 추가 (DECISIONS/ 에 새 파일)
+  - 새 도메인 / 새 모듈 boundary / 새 외부 의존성
+  - ARCHITECTURE.md 에 명시된 구조 변경
+- **medium** — 배치 큐 (주간 처리로 충분)
+  - 변경 파일 ≥ 10 또는 줄 ≥ 500
+  - 도메인 안 큰 리팩터 (boundary 변경 X)
+  - CONVENTIONS 영향 가능 (네이밍 / 패턴 변경 가능)
+- **low** — SoT 영향 없음 / 자동 갱신 불필요
+  - 작은 bugfix / typo / 문서 오타 정정 / 테스트만 추가
+  - 같은 모듈 안 isolated 변경
+  - PR 이 직접 docs/* 수정 (SoT 자체 갱신은 PR 이 이미 함)
+
+판정 기준 명확하지 않으면 보수적으로 **low** — 사람이 사후 `ah:sot-urgent` 부착 가능.
 
 ## Severity 가이드
 
