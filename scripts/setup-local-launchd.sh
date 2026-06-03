@@ -16,6 +16,10 @@
 #   bash scripts/setup-local-launchd.sh --status [repo]
 #     설치된 agentic-harness LaunchAgent 목록 / 상태.
 #
+#   bash scripts/setup-local-launchd.sh --weekly <repo> [repo_cwd]
+#     주간 SoT batch (ADR-017) — 일요일 02:00 에 `ah sot-batch` 실행.
+#     별도 plist (com.agentic-harness.<slug>.weekly.plist).
+#
 # Default interval: 300 초 (5분).
 # 로그: ~/Library/Logs/agentic-harness/<slug>.{out,err}
 # ============================================================================
@@ -38,8 +42,12 @@ case "${1:-}" in
         MODE="status"
         shift
         ;;
+    --weekly|-w)
+        MODE="weekly"
+        shift
+        ;;
     --help|-h|"")
-        sed -n '2,21p' "${BASH_SOURCE[0]}"
+        sed -n '2,25p' "${BASH_SOURCE[0]}"
         exit 0
         ;;
 esac
@@ -72,6 +80,94 @@ if [ "$MODE" = "uninstall" ]; then
     launchctl unload -w "$PLIST" 2>/dev/null || true
     rm "$PLIST"
     echo "✓ unload + 삭제: $PLIST"
+    # weekly plist 도 함께 정리
+    WEEKLY_PLIST="$LAUNCHD_DIR/${LABEL}.weekly.plist"
+    if [ -f "$WEEKLY_PLIST" ]; then
+        launchctl unload -w "$WEEKLY_PLIST" 2>/dev/null || true
+        rm "$WEEKLY_PLIST"
+        echo "✓ weekly LaunchAgent 도 제거: $WEEKLY_PLIST"
+    fi
+    exit 0
+fi
+
+# ── weekly (SoT batch — ADR-017) ──────────────────────────────────────────
+if [ "$MODE" = "weekly" ]; then
+    REPO_CWD="${2:-$HOME/dev-private/$(basename "$REPO")}"
+    AH_BIN="${AGENTIC_HARNESS_DIR:-$HOME/dev-private/agentic-harness}/.venv/bin/ah"
+    [ -x "$AH_BIN" ] || { echo "❌ $AH_BIN 없음" >&2; exit 2; }
+
+    WEEKLY_PLIST="$LAUNCHD_DIR/${LABEL}.weekly.plist"
+    WEEKLY_LABEL="${LABEL}.weekly"
+    CLAUDE_BIN="${CLAUDE_BIN:-$(command -v claude || echo /opt/homebrew/bin/claude)}"
+    LAUNCHD_PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$(dirname "$CLAUDE_BIN")"
+
+    cat > "$WEEKLY_PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>${WEEKLY_LABEL}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>${AH_BIN}</string>
+        <string>sot-batch</string>
+        <string>--repo</string>
+        <string>${REPO}</string>
+        <string>--cwd</string>
+        <string>${REPO_CWD}</string>
+    </array>
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Weekday</key>
+        <integer>0</integer>   <!-- 일요일 -->
+        <key>Hour</key>
+        <integer>2</integer>   <!-- 02:00 -->
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+    <key>RunAtLoad</key>
+    <false/>
+    <key>WorkingDirectory</key>
+    <string>${REPO_CWD}</string>
+    <key>AbandonProcessGroup</key>
+    <true/>
+    <key>ExitTimeOut</key>
+    <integer>3600</integer>
+    <key>StandardOutPath</key>
+    <string>${LOG_DIR}/${SLUG}.weekly.out</string>
+    <key>StandardErrorPath</key>
+    <string>${LOG_DIR}/${SLUG}.weekly.err</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key><string>${LAUNCHD_PATH}</string>
+        <key>HOME</key><string>${HOME}</string>
+        <key>HARNESS_MODE</key><string>local</string>
+        <key>CLAUDE_BIN</key><string>${CLAUDE_BIN}</string>
+    </dict>
+    <key>ProcessType</key>
+    <string>Background</string>
+    <key>Nice</key>
+    <integer>10</integer>
+</dict>
+</plist>
+EOF
+
+    launchctl unload -w "$WEEKLY_PLIST" 2>/dev/null || true
+    launchctl load -w "$WEEKLY_PLIST"
+    echo ""
+    echo "✓ Weekly SoT batch LaunchAgent 등록됨"
+    echo "  - label : ${WEEKLY_LABEL}"
+    echo "  - plist : ${WEEKLY_PLIST}"
+    echo "  - 주기  : 매주 일요일 02:00"
+    echo "  - 동작  : ah sot-batch --repo ${REPO} (threshold 5)"
+    echo "  - 로그  : ${LOG_DIR}/${SLUG}.weekly.{out,err}"
+    echo ""
+    echo "▶ 수동 1회 트리거:"
+    echo "    launchctl start ${WEEKLY_LABEL}"
+    echo ""
+    echo "▶ 또는 즉시 처리:"
+    echo "    .venv/bin/ah sot-batch --repo ${REPO} --force"
     exit 0
 fi
 

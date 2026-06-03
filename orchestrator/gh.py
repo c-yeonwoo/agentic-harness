@@ -722,15 +722,17 @@ async def ensure_label(
 # 전체 state machine: ADR-012 (Agent team 재정의) 참조.
 STANDARD_LABELS: list[tuple[str, str, str]] = [
     # ADR-014: 워크플로우 라벨은 항상 정확히 1개 (배타적). lock 은 assignee 로 직교.
-    # ah:in-progress 폐기 — bot assignee 가 lock 역할.
+    # ADR-017: SoT 갱신은 urgent (즉시) / batch (주간) 2-tier.
     ("ah:needs-execution", "fbca04", "developer 대기 (issue) — 새 task"),
     ("ah:needs-review",    "0e8a16", "reviewer 대기 (PR)"),
     ("ah:in-debate",       "d4c5f9", "developer amend 대기 (PR) — reviewer push back"),
     ("ah:needs-critique",  "5319e7", "critique final gate 대기 (PR)"),
     ("ah:awaiting-human",  "1d76db", "사람 결정 대기 (merge / escalation)"),
-    ("ah:sot-pending",     "fef2c0", "merged PR — PO mode B 가 SoT 갱신 필요"),
-    ("ah:sot-done",        "e6e6e6", "merged PR — PO mode B 처리 완료"),
+    ("ah:sot-urgent",      "b60205", "SoT 즉시 갱신 (BREAKING / ADR / 큰 구조 변경) — merge 시 PO mode B 즉시 트리거"),
+    ("ah:sot-batch",       "fef2c0", "SoT 배치 갱신 큐 (중간 영향) — 주간 cron 에서 5개 이상 모이면 처리"),
 ]
+# Note: ah:sot-pending / ah:sot-done 은 ADR-017 에서 폐기 (구현 전 갈아엎음).
+# 옛 라벨이 GitHub repo 에 있어도 무해 (poller 가 사용 안 함).
 
 
 async def ensure_standard_labels(repo: str) -> dict:
