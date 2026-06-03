@@ -101,12 +101,12 @@ def resolve_local_model(role: str = "developer") -> str:
 
     defaults = {
         "po": "sonnet",
-        "developer": "opus",
-        "developer-amend": "opus",
+        "developer": "opus",          # 신규 PR — 큰 작업, 품질 우선
+        "developer-amend": "sonnet",  # amend — 작은 수정 (코멘트/테스트/리뷰 반영) 위주, opus 의 1/5 비용
         "reviewer": "sonnet",
         "critique": "sonnet",
         "executor": "opus",           # back-compat alias
-        "executor-amend": "opus",
+        "executor-amend": "sonnet",
     }
     return defaults.get(role, "sonnet")
 

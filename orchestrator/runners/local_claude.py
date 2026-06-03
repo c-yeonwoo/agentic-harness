@@ -854,12 +854,12 @@ class LocalClaudeRunner:
                 )
 
             # 7) PR body 생성 — `/pr-description` 스킬을 worktree 에서 추가 spawn.
-            #    스킬은 git log/diff 를 기반으로 본문 작성. 실패 시 executor JSON 의
-            #    payload.pr_body 로 fallback.
+            #    **신규 PR (existing_branch=None) 일 때만**. amend mode 는 PR body 이미
+            #    있으므로 skip (이전엔 매 amend 마다 호출해서 ~$0.30 낭비).
             pr_body_via_skill: Optional[str] = None
             pr_desc_cost = 0.0
             pr_desc_model = ""
-            if PR_DESCRIPTION_SKILL:
+            if PR_DESCRIPTION_SKILL and not ctx.existing_branch:
                 pr_body_via_skill, pr_desc_env, pr_desc_rc, _ = await _spawn_pr_description_skill(
                     cwd=wt.path,
                     base_branch=push_info["base"],
@@ -872,6 +872,8 @@ class LocalClaudeRunner:
                          used_skill=bool(pr_body_via_skill),
                          body_chars=len(pr_body_via_skill or ""),
                          cost=pr_desc_cost, rc=pr_desc_rc)
+            elif ctx.existing_branch:
+                log.info("local_claude.pr_description.skipped_amend", pr=ctx.issue_or_pr_number)
 
             final_pr_body = pr_body_via_skill or payload.get("pr_body")
             pr_body_source = "pr-description-skill" if pr_body_via_skill else "executor-json"
