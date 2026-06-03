@@ -112,7 +112,32 @@ async def poll_once(repo: str, cwd: Path, bot_user: str) -> dict:
             else:
                 stats["skipped"] += 1
 
-    # 4) ah:sot-urgent merged PRs → PO mode B (즉시 단일 PR 분석) — ADR-017
+    # 4) ah:needs-critique PRs → critique (final gate, suggestion-only) — ADR-012
+    try:
+        c_raw = await gh.list_prs(repo, label="ah:needs-critique")
+    except Exception as exc:
+        log.warning("poll.list_failed", error=str(exc), agent="critique")
+        c_raw = []
+    c_candidates = _filter_unlocked(c_raw, bot_user)
+
+    if c_candidates:
+        log.info("poll.found", count=len(c_candidates), agent="critique")
+        slots = c_candidates[:max_reviewers]
+        results = await asyncio.gather(
+            *[agents.run_code_critique(repo, p, sot, bot_user, repo_cwd=cwd) for p in slots],
+            return_exceptions=True,
+        )
+        for r in results:
+            if isinstance(r, Exception):
+                stats["errors"] += 1
+                log.warning("poll.critique_exc", error=str(r))
+            elif r:
+                stats.setdefault("critiqued", 0)
+                stats["critiqued"] += 1
+            else:
+                stats["skipped"] += 1
+
+    # 5) ah:sot-urgent merged PRs → PO mode B (즉시 단일 PR 분석) — ADR-017
     try:
         u_raw = await gh.list_prs(
             repo, label="ah:sot-urgent", state="closed", limit=10,
