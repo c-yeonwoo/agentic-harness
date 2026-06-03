@@ -649,6 +649,31 @@ async def run_po_mode_b(
     if not (repo_cwd / ".git").exists():
         return {"ok": False, "error": f"repo cwd 가 git repo 아님: {repo_cwd}"}
 
+    # Budget cap 검사 — SOT_UPDATE_BUDGET_USD_PER_WEEK (ADR-017)
+    budget = float(os.environ.get("SOT_UPDATE_BUDGET_USD_PER_WEEK", "0") or 0)
+    if budget > 0:
+        try:
+            from orchestrator import cost_report as cr
+            import time as _t
+            since = _t.time() - 7 * 86400
+            entries = cr.from_logs(since)
+            # SoT 갱신 관련 비용만 집계 (po / pr_description / sot 키워드)
+            spent = sum(
+                e.cost_usd for e in entries
+                if e.agent in ("po", "po_mode_b") or "sot" in e.agent.lower()
+            )
+            # PO mode B 코멘트 footer 도 합산 (정확) — async 호출이라 best-effort
+            if spent >= budget:
+                log.warning("po.mode_b.budget_exceeded",
+                            repo=repo, spent=spent, budget=budget, mode=mode)
+                return {
+                    "ok": False,
+                    "error": f"주간 SoT budget ${budget:.2f} 초과 (현재 ${spent:.2f}) — skip",
+                    "budget_exceeded": True,
+                }
+        except Exception as exc:
+            log.warning("po.mode_b.budget_check_failed", error=str(exc))
+
     log.info("po.mode_b.start", repo=repo, mode=mode, prs=pr_numbers)
 
     # 1) target PR 들 fetch
@@ -961,14 +986,17 @@ async def run_code_reviewer(
             DEBATE_MARK = "🔁 **debate round"
 
             if verdict == "approve":
-                # 최종 게이트 통과 — 사람 merge 결정 대기
-                # in-debate 라벨이 붙어있었다면 제거
+                # reviewer approve → critique final gate 로 (ADR-012)
+                # SoT 갱신 PR (PO mode B) 은 critique skip — title 로 식별
+                title = pr.title or ""
+                skip_critique = title.startswith("docs(sot):") or title.startswith("chore(sot)")
                 try:
                     await gh.remove_label(repo, "pr", pr.number, "ah:in-debate")
                 except Exception:
                     pass
+                next_label = "ah:awaiting-human" if skip_critique else "ah:needs-critique"
                 try:
-                    await gh.add_label(repo, "pr", pr.number, "ah:awaiting-human")
+                    await gh.add_label(repo, "pr", pr.number, next_label)
                 except Exception as exc:
                     log.warning("reviewer.add_label_failed", error=str(exc))
             else:
@@ -1140,5 +1168,167 @@ def _format_review_comment(review: dict, call_info: llm.LlmCall) -> str:
         "---",
         f"_cost ${call_info.cost_usd:.4f} · "
         f"{call_info.input_tokens} in / {call_info.output_tokens} out · model={call_info.model}_",
+    ]
+    return "\n".join(parts)
+
+
+# ── Critique (final gate, suggestion-only — ADR-012) ─────────────────────────
+
+
+async def run_code_critique(
+    repo: str,
+    pr: gh.PullRequest,
+    sot: SourceOfTruth,
+    bot_user: str,
+    model: Optional[str] = None,
+    repo_cwd: Optional[Path] = None,
+) -> bool:
+    """`ah:needs-critique` PR → suggestion 코멘트 + ah:awaiting-human 으로 전이.
+
+    block 권한 없음. 항상 awaiting-human 으로. critique 의 verdict 는 사람 merge 참고용.
+    """
+    cwd_for_lock = _resolve_repo_cwd(repo, repo_cwd)
+    if not (cwd_for_lock / ".git").exists():
+        log.error("critique.cwd_not_git", cwd=str(cwd_for_lock))
+        return False
+    if not await lock.acquire(repo, "pr", pr.number, bot_user, repo_cwd=cwd_for_lock):
+        log.info("critique.lock_skipped", pr=pr.number)
+        return False
+
+    try:
+        try:
+            # PR 컨텍스트 (캐시)
+            from orchestrator import pr_context as prctx
+            ctx = await prctx.discover_pr(
+                repo=repo, repo_cwd=cwd_for_lock, pr_number=pr.number, pr=pr,
+            )
+
+            agents_dir = Path(__file__).resolve().parent.parent / "agents"
+            role_prompt = (agents_dir / "critique-local.md").read_text(encoding="utf-8")
+            system_prompt = role_prompt + "\n\n" + sot.to_prompt()
+
+            files_summary = "\n".join(
+                f"- `{f['path']}` (+{f['additions']} / -{f['deletions']})"
+                for f in ctx.files
+            )
+            recent_comments = "\n\n".join(
+                f"--- {c.get('author','?')} @ {c.get('createdAt','')} ---\n{c.get('body','')[:1500]}"
+                for c in ctx.comments[-5:]
+            )
+            user_msg = (
+                f"# PR #{pr.number}: {pr.title}\n\n"
+                f"URL: {pr.url}\n"
+                f"reviewer 가 approve 한 상태. 사람 merge 결정 직전 final gate.\n\n"
+                f"## PR body\n{pr.body}\n\n"
+                f"## Files changed ({len(ctx.files)})\n{files_summary}\n\n"
+                f"## 최근 코멘트 (reviewer / 사람)\n{recent_comments or '(없음)'}\n\n"
+                f"## Diff\n```diff\n{ctx.diff}\n```\n"
+            )
+
+            log.info("critique.start", pr=pr.number, model=model)
+            from orchestrator.runners.local_claude import run_critique_local
+            from orchestrator.runners import resolve_local_model
+            res = await run_critique_local(
+                repo_cwd=cwd_for_lock,
+                system_prompt=system_prompt,
+                user_prompt=user_msg,
+                model=model or resolve_local_model("critique"),
+            )
+
+            if res.error:
+                await gh.comment_pr(repo, pr.number,
+                    f"❌ critique 실패: {res.error}\n\n"
+                    f"_라벨 전이: ah:needs-critique → ah:awaiting-human (block X)_\n"
+                    f"_cost ${res.cost_usd:.4f}_"
+                )
+            else:
+                # suggestion 코멘트 게시
+                body = _format_critique_comment(res)
+                try:
+                    await gh.comment_pr(repo, pr.number, body)
+                except Exception as exc:
+                    log.warning("critique.comment_failed", error=str(exc))
+
+            # 라벨 전이: needs-critique → awaiting-human (block X)
+            try:
+                await gh.remove_label(repo, "pr", pr.number, "ah:needs-critique")
+            except Exception:
+                pass
+            try:
+                await gh.add_label(repo, "pr", pr.number, "ah:awaiting-human")
+            except Exception as exc:
+                log.warning("critique.add_label_failed", error=str(exc))
+
+            log.info("critique.done", pr=pr.number,
+                     judgment=res.overall_judgment,
+                     suggestions=len(res.suggestions),
+                     cost=round(res.cost_usd, 4))
+            return True
+        except Exception as exc:
+            log.exception("critique.crashed", pr=pr.number, error=str(exc))
+            try:
+                await gh.comment_pr(repo, pr.number,
+                    f"❌ **critique 예외 발생**\n\n"
+                    f"```\n{type(exc).__name__}: {exc}\n```\n\n"
+                    f"라벨 전이: ah:needs-critique → ah:awaiting-human"
+                )
+            except Exception:
+                pass
+            # 예외 시에도 라벨 전이 (stuck 방지)
+            try:
+                await gh.remove_label(repo, "pr", pr.number, "ah:needs-critique")
+                await gh.add_label(repo, "pr", pr.number, "ah:awaiting-human")
+            except Exception:
+                pass
+            return False
+    finally:
+        await lock.release(repo, "pr", pr.number, bot_user, repo_cwd=cwd_for_lock)
+
+
+def _format_critique_comment(res) -> str:
+    j = res.overall_judgment
+    emoji = {"ship": "✅", "ship_with_improvements": "🟡", "reconsider": "🤔"}.get(j, "❓")
+    parts = [
+        f"## 🧐 critique — {emoji} `{j}`",
+        "",
+        f"**Summary**: {res.summary or '(요약 없음)'}",
+        "",
+        "_📌 critique 는 **suggestion-only** — block 권한 없음. 사람 merge 결정 시 참고._",
+        "",
+    ]
+    sug = res.suggestions or []
+    if sug:
+        parts.append(f"### 개선 제안 ({len(sug)})")
+        pri_emoji = {
+            "nice-to-have": "💭",
+            "recommended": "💡",
+            "strongly-recommended": "⚡",
+        }
+        for s in sug:
+            p = (s.get("priority") or "nice-to-have").lower()
+            cat = s.get("category", "?")
+            loc = s.get("location") or ""
+            loc_str = f" @ `{loc}`" if loc else ""
+            parts.append(
+                f"\n#### {pri_emoji.get(p, '•')} [{p}/{cat}]{loc_str}"
+            )
+            if s.get("current"):
+                parts.append(f"**현재**: {s['current']}")
+            if s.get("alternative"):
+                parts.append(f"**제안**: {s['alternative']}")
+            if s.get("rationale"):
+                parts.append(f"**이유**: {s['rationale']}")
+        parts.append("")
+    pos = res.positives or []
+    if pos:
+        parts.append("### 잘한 점")
+        for p in pos:
+            parts.append(f"- ✓ {p}")
+        parts.append("")
+
+    parts += [
+        "---",
+        f"_cost ${res.cost_usd:.4f} · "
+        f"{res.input_tokens} in / {res.output_tokens} out · model={res.model}_",
     ]
     return "\n".join(parts)

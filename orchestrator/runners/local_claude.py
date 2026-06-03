@@ -748,6 +748,191 @@ async def run_po_mode_a_local(
 
 
 @dataclass
+class LocalSotDriftResult:
+    """SoT drift check 결과."""
+    severity: str = "none"          # none | minor | major
+    summary: str = ""
+    drifts: list = None             # type: ignore
+    create_issue: bool = False
+    issue_title: str = ""
+    issue_body: str = ""
+    raw_text: str = ""
+    cost_usd: float = 0.0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    model: str = ""
+    error: Optional[str] = None
+
+    def __post_init__(self):
+        if self.drifts is None: self.drifts = []
+
+
+async def run_sot_drift_check_local(
+    *,
+    repo_cwd: Path,
+    repo: str,
+    sot_prompt: str,
+    timeout_sec: int = 900,
+    model: Optional[str] = None,
+) -> LocalSotDriftResult:
+    """SoT drift check — claude -p 가 SoT 와 실제 코드 비교."""
+    from orchestrator.runners import resolve_local_model
+    model = model or resolve_local_model("po")
+
+    agents_dir = Path(__file__).resolve().parent.parent.parent / "agents"
+    prompt_path = agents_dir / "sot-drift-check-local.md"
+    if not prompt_path.exists():
+        return LocalSotDriftResult(error=f"agents/sot-drift-check-local.md 없음")
+    role_prompt = prompt_path.read_text(encoding="utf-8")
+    system_prompt = role_prompt + "\n\n" + sot_prompt
+
+    user_prompt = (
+        f"# SoT Drift Check\n\nrepo: {repo}\ncwd: `{repo_cwd}`\n\n"
+        f"위 SoT 가 실제 코드를 잘 반영하는지 sampling 으로 점검. "
+        f"빌드 명령 / 디렉토리 구조 / GLOSSARY 누락 / ADR vs 코드 / 컨벤션 위반 "
+        f"순서로 확인. drift 발견 시 JSON 으로 정리."
+    )
+
+    log.info("sot_drift.spawn", repo=repo, model=model)
+    rc, stdout, stderr = await _spawn_claude(
+        cwd=repo_cwd,
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        timeout_sec=timeout_sec,
+        extra_disallowed=["Edit", "Write"],  # 점검만 — 수정 X
+        model=model,
+    )
+
+    assistant_text, env = _parse_claude_json_envelope(stdout)
+    if assistant_text is None:
+        assistant_text = stdout
+
+    cost = float(env.get("total_cost_usd") or 0.0)
+    usage = env.get("usage") or {}
+    in_tok = int(usage.get("input_tokens") or 0)
+    out_tok = int(usage.get("output_tokens") or 0)
+    used_model = env.get("model") or model or ""
+    is_error = bool(env.get("is_error"))
+
+    if rc != 0 or is_error:
+        return LocalSotDriftResult(
+            raw_text=assistant_text or "",
+            cost_usd=cost, input_tokens=in_tok, output_tokens=out_tok,
+            model=used_model,
+            error=f"drift check failed — rc={rc}",
+        )
+
+    payload = _extract_result_json(assistant_text)
+    if not isinstance(payload, dict):
+        m = re.search(r"```(?:json)?\s*\n(\{[\s\S]*?\})\s*\n```", assistant_text or "")
+        if m:
+            try: payload = json.loads(m.group(1))
+            except json.JSONDecodeError: payload = None
+    if not isinstance(payload, dict):
+        payload = {}
+
+    return LocalSotDriftResult(
+        severity=payload.get("severity") or "none",
+        summary=payload.get("summary") or "",
+        drifts=payload.get("drifts") or [],
+        create_issue=bool(payload.get("create_issue")),
+        issue_title=payload.get("issue_title") or "",
+        issue_body=payload.get("issue_body") or "",
+        raw_text=assistant_text or "",
+        cost_usd=cost, input_tokens=in_tok, output_tokens=out_tok, model=used_model,
+    )
+
+
+@dataclass
+class LocalCritiqueResult:
+    """run_critique_local 의 반환 — suggestion 들 + overall judgment."""
+    summary: str = ""
+    overall_judgment: str = "ship"
+    suggestions: list = None      # type: ignore
+    positives: list = None        # type: ignore
+    raw_text: str = ""
+    cost_usd: float = 0.0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    model: str = ""
+    error: Optional[str] = None
+
+    def __post_init__(self):
+        if self.suggestions is None: self.suggestions = []
+        if self.positives is None: self.positives = []
+
+
+async def run_critique_local(
+    *,
+    repo_cwd: Path,
+    system_prompt: str,
+    user_prompt: str,
+    timeout_sec: int = 1200,
+    model: Optional[str] = None,
+) -> LocalCritiqueResult:
+    """Critique agent — PR 에 메타 비평 (block 권한 없음, suggestion only)."""
+    from orchestrator.runners import resolve_local_model
+    model = model or resolve_local_model("critique")  # default sonnet
+
+    log.info("critique.local.spawn", cwd=str(repo_cwd), model=model)
+
+    rc, stdout, stderr = await _spawn_claude(
+        cwd=repo_cwd,
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        timeout_sec=timeout_sec,
+        extra_disallowed=["Edit", "Write"],  # critique 도 코드 수정 X
+        model=model,
+    )
+
+    assistant_text, env = _parse_claude_json_envelope(stdout)
+    if assistant_text is None:
+        assistant_text = stdout
+
+    cost = float(env.get("total_cost_usd") or 0.0)
+    usage = env.get("usage") or {}
+    in_tok = int(usage.get("input_tokens") or 0)
+    out_tok = int(usage.get("output_tokens") or 0)
+    used_model = env.get("model") or model or ""
+    is_error = bool(env.get("is_error"))
+
+    if rc != 0 or is_error:
+        api_status = env.get("api_error_status")
+        detail = (assistant_text or "").strip() or stderr.strip() or stdout.strip()[:600]
+        return LocalCritiqueResult(
+            raw_text=assistant_text or "",
+            cost_usd=cost, input_tokens=in_tok, output_tokens=out_tok,
+            model=used_model,
+            error=f"critique failed — rc={rc} api_status={api_status}: {detail[:600]}",
+        )
+
+    payload = _extract_result_json(assistant_text)
+    if not isinstance(payload, dict):
+        m = re.search(r"```(?:json)?\s*\n(\{[\s\S]*?\})\s*\n```", assistant_text or "")
+        if m:
+            try:
+                payload = json.loads(m.group(1))
+            except json.JSONDecodeError:
+                payload = None
+    if not isinstance(payload, dict):
+        return LocalCritiqueResult(
+            raw_text=assistant_text or "",
+            cost_usd=cost, input_tokens=in_tok, output_tokens=out_tok,
+            model=used_model,
+            error="critique JSON 파싱 실패",
+        )
+
+    return LocalCritiqueResult(
+        summary=payload.get("summary") or "",
+        overall_judgment=payload.get("overall_judgment") or "ship",
+        suggestions=payload.get("suggestions") or [],
+        positives=payload.get("positives") or [],
+        raw_text=assistant_text or "",
+        cost_usd=cost, input_tokens=in_tok, output_tokens=out_tok, model=used_model,
+    )
+
+
+@dataclass
 class LocalReviewerResult:
     """run_reviewer_local 의 반환 타입 — agents.py 가 기존 review dict 처럼 사용."""
     review: Optional[dict]               # 파싱된 review JSON. None 이면 실패.
