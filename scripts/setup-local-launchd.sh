@@ -96,6 +96,29 @@ fi
 CLAUDE_BIN="${CLAUDE_BIN:-$(command -v claude || echo /opt/homebrew/bin/claude)}"
 LAUNCHD_PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$(dirname "$CLAUDE_BIN")"
 
+# StartCalendarInterval 생성 — StartInterval 보다 sleep/wake 후 신뢰성 ↑
+# (절대 시간 기준 매 N 분 — 깬 직후 다음 슬롯에 catch-up 자동)
+INTERVAL_MIN=$((INTERVAL_SEC / 60))
+if [ "$INTERVAL_MIN" -lt 1 ]; then
+    echo "⚠️  interval $INTERVAL_SEC < 60초 — 1분으로 보정 (StartCalendarInterval 분 단위 한계)" >&2
+    INTERVAL_MIN=1
+fi
+if [ $((60 % INTERVAL_MIN)) -ne 0 ] && [ "$INTERVAL_MIN" -lt 60 ]; then
+    echo "⚠️  60분이 ${INTERVAL_MIN}분으로 안 나눠짐 — 시간 경계 근처에선 간격이 틀어질 수 있음" >&2
+fi
+
+CAL_ENTRIES=""
+if [ "$INTERVAL_MIN" -ge 60 ]; then
+    # 1시간 이상 — 매 시간 한 번 + 분 = 0
+    CAL_ENTRIES="
+        <dict><key>Minute</key><integer>0</integer></dict>"
+else
+    for ((m=0; m<60; m+=INTERVAL_MIN)); do
+        CAL_ENTRIES="${CAL_ENTRIES}
+        <dict><key>Minute</key><integer>${m}</integer></dict>"
+    done
+fi
+
 cat > "$PLIST" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -115,12 +138,17 @@ cat > "$PLIST" <<EOF
         <string>--mode</string>
         <string>local</string>
     </array>
-    <key>StartInterval</key>
-    <integer>${INTERVAL_SEC}</integer>
+    <key>StartCalendarInterval</key>
+    <array>${CAL_ENTRIES}
+    </array>
     <key>RunAtLoad</key>
-    <false/>
+    <true/>
     <key>WorkingDirectory</key>
     <string>${REPO_CWD}</string>
+    <key>AbandonProcessGroup</key>
+    <true/>
+    <key>ExitTimeOut</key>
+    <integer>3600</integer>
     <key>StandardOutPath</key>
     <string>${LOG_DIR}/${SLUG}.out</string>
     <key>StandardErrorPath</key>

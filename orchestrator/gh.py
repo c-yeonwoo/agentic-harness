@@ -63,6 +63,8 @@ class PullRequest:
     merged: bool
     merged_at: Optional[str]
     url: str
+    head_sha: str = ""   # PR cache 무효화 key (head commit SHA)
+    updated_at: str = "" # comments_count 와 함께 cache 무효화 보조
 
     @property
     def label_set(self) -> set[str]:
@@ -212,6 +214,8 @@ def _parse_pr_http(raw: dict) -> PullRequest:
         merged=merged,
         merged_at=raw.get("merged_at"),
         url=raw.get("html_url", "") or "",
+        head_sha=head.get("sha", "") if isinstance(head, dict) else "",
+        updated_at=raw.get("updated_at", "") or "",
     )
 
 
@@ -260,6 +264,8 @@ def _parse_pr_cli(raw: dict) -> PullRequest:
         merged=raw.get("state", "").upper() == "MERGED",
         merged_at=raw.get("mergedAt"),
         url=raw.get("url", "") or "",
+        head_sha=raw.get("headRefOid", "") or "",
+        updated_at=raw.get("updatedAt", "") or "",
     )
 
 
@@ -430,7 +436,7 @@ async def list_prs(
             "--repo", repo,
             "--state", state,
             "--limit", str(limit),
-            "--json", "number,title,body,headRefName,baseRefName,labels,assignees,state,mergedAt,url",
+            "--json", "number,title,body,headRefName,headRefOid,baseRefName,labels,assignees,state,mergedAt,url,updatedAt",
         ]
         if label:
             cmd += ["--label", label]
@@ -447,7 +453,7 @@ async def get_pr(repo: str, number: int) -> PullRequest:
     cmd = [
         "gh", "pr", "view", str(number),
         "--repo", repo,
-        "--json", "number,title,body,headRefName,baseRefName,labels,assignees,state,mergedAt,url",
+        "--json", "number,title,body,headRefName,headRefOid,baseRefName,labels,assignees,state,mergedAt,url,updatedAt",
     ]
     return _parse_pr_cli(json.loads(await _gh_run(cmd)))
 
@@ -715,14 +721,15 @@ async def ensure_label(
 # 표준 라벨 정의 — color + description.
 # 전체 state machine: ADR-012 (Agent team 재정의) 참조.
 STANDARD_LABELS: list[tuple[str, str, str]] = [
-    ("ah:needs-execution", "fbca04", "developer 대기 (issue 신규 또는 PR amend)"),
+    # ADR-014: 워크플로우 라벨은 항상 정확히 1개 (배타적). lock 은 assignee 로 직교.
+    # ah:in-progress 폐기 — bot assignee 가 lock 역할.
+    ("ah:needs-execution", "fbca04", "developer 대기 (issue) — 새 task"),
     ("ah:needs-review",    "0e8a16", "reviewer 대기 (PR)"),
-    ("ah:in-debate",       "d4c5f9", "developer 가 review 에 반박 중 — 다음 tick reviewer 재평가"),
-    ("ah:needs-critique",  "5319e7", "reviewer 통과 후 critique final gate 대기"),
+    ("ah:in-debate",       "d4c5f9", "developer amend 대기 (PR) — reviewer push back"),
+    ("ah:needs-critique",  "5319e7", "critique final gate 대기 (PR)"),
     ("ah:awaiting-human",  "1d76db", "사람 결정 대기 (merge / escalation)"),
-    ("ah:in-progress",     "c5def5", "agent 가 처리 중 (락 — issue/PR)"),
     ("ah:sot-pending",     "fef2c0", "merged PR — PO mode B 가 SoT 갱신 필요"),
-    ("ah:sot-done",        "e6e6e6", "merged PR — PO mode B 가 처리 완료 (skip)"),
+    ("ah:sot-done",        "e6e6e6", "merged PR — PO mode B 처리 완료"),
 ]
 
 

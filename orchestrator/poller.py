@@ -2,6 +2,10 @@
 
 interval (default 30s) 마다 라벨 별 issue/PR 발견 → 락 → agent 실행.
 launchd / Hermes cron 의 호출 단위는 `ah run --once` (이 poll_once).
+
+ADR-014: lock 은 assignee 기반 (ah:in-progress 라벨 폐기). 워크플로우 라벨은
+항상 정확히 1개. 폴러는 "라벨 X 인데 bot_user 가 아직 assignee 가 아닌 것" 만
+픽업해서 다른 인스턴스 / 직전 crash 충돌 회피.
 """
 from __future__ import annotations
 
@@ -18,26 +22,29 @@ from orchestrator.source_of_truth import discover
 log = structlog.get_logger()
 
 
+def _filter_unlocked(items, bot_user: str):
+    """bot 이 이미 assignee 인 항목 (= 다른 인스턴스가 잡았거나 직전 crash 잔존) 제외."""
+    return [x for x in items if bot_user not in x.assignees]
+
+
 async def poll_once(repo: str, cwd: Path, bot_user: str) -> dict:
     """1회 polling. 발견된 task 처리 후 통계 반환."""
     stats = {"executed": 0, "skipped": 0, "errors": 0}
 
     sot = await discover(cwd)
-    # MAX_PARALLEL_DEVELOPERS / MAX_PARALLEL_EXECUTORS 둘 다 인식 (ADR-012)
     max_devs = int(
         os.environ.get("MAX_PARALLEL_DEVELOPERS")
         or os.environ.get("MAX_PARALLEL_EXECUTORS", "3")
     )
     max_reviewers = int(os.environ.get("MAX_PARALLEL_REVIEWERS", "3"))
 
-    # 1) ah:needs-execution issues → developer
+    # 1) ah:needs-execution issues → developer (new task)
     try:
-        e_candidates = await gh.list_issues(
-            repo, label="ah:needs-execution", no_label="ah:in-progress",
-        )
+        e_raw = await gh.list_issues(repo, label="ah:needs-execution")
     except Exception as exc:
         log.warning("poll.list_failed", error=str(exc), agent="developer")
-        e_candidates = []
+        e_raw = []
+    e_candidates = _filter_unlocked(e_raw, bot_user)
 
     if e_candidates:
         log.info("poll.found", count=len(e_candidates), agent="developer")
@@ -57,12 +64,11 @@ async def poll_once(repo: str, cwd: Path, bot_user: str) -> dict:
 
     # 2) ah:needs-review PRs → code-reviewer
     try:
-        r_candidates = await gh.list_prs(
-            repo, label="ah:needs-review", no_label="ah:in-progress",
-        )
+        r_raw = await gh.list_prs(repo, label="ah:needs-review")
     except Exception as exc:
         log.warning("poll.list_failed", error=str(exc), agent="reviewer")
-        r_candidates = []
+        r_raw = []
+    r_candidates = _filter_unlocked(r_raw, bot_user)
 
     if r_candidates:
         log.info("poll.found", count=len(r_candidates), agent="code-reviewer")
@@ -81,26 +87,13 @@ async def poll_once(repo: str, cwd: Path, bot_user: str) -> dict:
             else:
                 stats["skipped"] += 1
 
-    # 3) ah:in-debate PRs → developer amend (ADR-012 debate cycle)
-    #    reviewer 가 concerns_noted / request_changes 면 PR 에 ah:in-debate 만 붙음.
-    #    poller 가 이걸 발견 → developer amend mode.
-    #    (옛 hermes 흐름은 ah:needs-execution PR 도 amend trigger 였음 — 같이 봄)
+    # 3) ah:in-debate PRs → developer amend (debate cycle)
     try:
-        d_candidates = await gh.list_prs(
-            repo, label="ah:in-debate", no_label="ah:in-progress",
-        )
-        # back-compat: 옛 흐름이 만든 ah:needs-execution PR 도 amend 대상
-        legacy = await gh.list_prs(
-            repo, label="ah:needs-execution", no_label="ah:in-progress",
-        )
-        # dedup
-        seen = {p.number for p in d_candidates}
-        for p in legacy:
-            if p.number not in seen:
-                d_candidates.append(p)
+        d_raw = await gh.list_prs(repo, label="ah:in-debate")
     except Exception as exc:
         log.warning("poll.list_failed", error=str(exc), agent="developer-amend")
-        d_candidates = []
+        d_raw = []
+    d_candidates = _filter_unlocked(d_raw, bot_user)
 
     if d_candidates:
         log.info("poll.found", count=len(d_candidates), agent="developer-amend")
