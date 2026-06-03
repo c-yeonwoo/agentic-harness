@@ -63,6 +63,8 @@ class PullRequest:
     merged: bool
     merged_at: Optional[str]
     url: str
+    head_sha: str = ""   # PR cache 무효화 key (head commit SHA)
+    updated_at: str = "" # comments_count 와 함께 cache 무효화 보조
 
     @property
     def label_set(self) -> set[str]:
@@ -212,6 +214,8 @@ def _parse_pr_http(raw: dict) -> PullRequest:
         merged=merged,
         merged_at=raw.get("merged_at"),
         url=raw.get("html_url", "") or "",
+        head_sha=head.get("sha", "") if isinstance(head, dict) else "",
+        updated_at=raw.get("updated_at", "") or "",
     )
 
 
@@ -260,6 +264,8 @@ def _parse_pr_cli(raw: dict) -> PullRequest:
         merged=raw.get("state", "").upper() == "MERGED",
         merged_at=raw.get("mergedAt"),
         url=raw.get("url", "") or "",
+        head_sha=raw.get("headRefOid", "") or "",
+        updated_at=raw.get("updatedAt", "") or "",
     )
 
 
@@ -430,7 +436,7 @@ async def list_prs(
             "--repo", repo,
             "--state", state,
             "--limit", str(limit),
-            "--json", "number,title,body,headRefName,baseRefName,labels,assignees,state,mergedAt,url",
+            "--json", "number,title,body,headRefName,headRefOid,baseRefName,labels,assignees,state,mergedAt,url,updatedAt",
         ]
         if label:
             cmd += ["--label", label]
@@ -447,7 +453,7 @@ async def get_pr(repo: str, number: int) -> PullRequest:
     cmd = [
         "gh", "pr", "view", str(number),
         "--repo", repo,
-        "--json", "number,title,body,headRefName,baseRefName,labels,assignees,state,mergedAt,url",
+        "--json", "number,title,body,headRefName,headRefOid,baseRefName,labels,assignees,state,mergedAt,url,updatedAt",
     ]
     return _parse_pr_cli(json.loads(await _gh_run(cmd)))
 

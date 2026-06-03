@@ -315,8 +315,12 @@ async def run_developer_amend(
         if not (cwd / ".git").exists():
             raise RuntimeError(f"repo cwd 가 git repo 아님: {cwd}")
 
-        # ── retry cap (1회) 검사 ──
-        recent_comments = await gh.pr_comments(repo, pr.number, limit=20)
+        # ── PR context 캐시 (ADR-015) ──
+        from orchestrator import pr_context as prctx
+        ctx = await prctx.discover_pr(
+            repo=repo, repo_cwd=cwd, pr_number=pr.number, pr=pr,
+        )
+        recent_comments = ctx.comments
         EDIT_FAIL_MARK = "❌ **edit 매칭 실패"
         edit_fail_count = sum(1 for c in recent_comments if EDIT_FAIL_MARK in c["body"])
         if edit_fail_count >= 2:
@@ -337,8 +341,34 @@ async def run_developer_amend(
             )
             return True
 
-        # review summary
+        # review summary — debate summary 우선, 없으면 raw comments
         review_summary = ""
+        # 1) debate summary (round 2+ 시 캐시 또는 생성)
+        if prctx.needs_summary(ctx):
+            log.info("developer.amend.generate_summary", pr=pr.number, round=ctx.debate_round)
+            try:
+                summary_text = await prctx.generate_debate_summary(
+                    repo_cwd=cwd, ctx=ctx,
+                )
+                if summary_text:
+                    try:
+                        await gh.comment_pr(repo, pr.number,
+                            f"📋 **debate summary (round {ctx.debate_round})**\n\n"
+                            f"{summary_text}\n\n"
+                            f"---\n{prctx.SUMMARY_MARKER}\n{summary_text}"
+                        )
+                    except Exception as exc:
+                        log.warning("developer.amend.summary_post_failed", error=str(exc))
+            except Exception as exc:
+                log.warning("developer.amend.summary_failed", error=str(exc))
+        # 2) summary 가 있으면 prompt 에 prepend (raw 대신 압축)
+        if ctx.debate_summary:
+            review_summary += (
+                f"\n## 📋 Debate summary (round {ctx.debate_round})\n"
+                f"{ctx.debate_summary}\n\n"
+                f"---\n## 최근 코멘트 (참고만 — 위 summary 가 우선)\n"
+            )
+        # 3) 최근 5개 raw (보조)
         for c in recent_comments[-5:]:
             snippet = c["body"][:1500]
             review_summary += f"\n--- {c['author']} @ {c['createdAt']} ---\n{snippet}\n"
@@ -630,10 +660,23 @@ async def run_code_reviewer(
 
     try:
         try:
-            diff = await gh.pr_diff(repo, pr.number)
-            files = await gh.pr_files(repo, pr.number)
-            linked = await gh.pr_linked_issues(repo, pr.number)
-            comments = await gh.pr_comments(repo, pr.number, limit=20)
+            # PR context 캐시 (ADR-015) — 4개 호출 → 1개 (cache hit) 또는 1 set (병렬 fetch)
+            from orchestrator import pr_context as prctx
+            cwd_for_cache = repo_cwd
+            if cwd_for_cache is None:
+                name = repo.split("/")[-1]
+                cwd_for_cache = Path.home() / "dev-private" / name
+                if not (cwd_for_cache / ".git").exists():
+                    cwd_for_cache = Path.home() / "dev" / name
+            if not (cwd_for_cache / ".git").exists():
+                cwd_for_cache = Path.cwd()
+            ctx = await prctx.discover_pr(
+                repo=repo, repo_cwd=cwd_for_cache, pr_number=pr.number, pr=pr,
+            )
+            diff = ctx.diff
+            files = ctx.files
+            linked = ctx.linked_issues
+            comments = ctx.comments
 
             linked_summary = ""
             for n in linked[:3]:
@@ -643,8 +686,32 @@ async def run_code_reviewer(
                 except Exception:
                     pass
 
+            # debate summary 우선 (round 2+ — round 1 은 raw 그대로)
             comments_summary = ""
             human_feedback_present = False
+            if prctx.needs_summary(ctx):
+                log.info("reviewer.generate_summary", pr=pr.number, round=ctx.debate_round)
+                try:
+                    summary_text = await prctx.generate_debate_summary(
+                        repo_cwd=cwd_for_cache, ctx=ctx,
+                    )
+                    if summary_text:
+                        try:
+                            await gh.comment_pr(repo, pr.number,
+                                f"📋 **debate summary (round {ctx.debate_round})**\n\n"
+                                f"{summary_text}\n\n"
+                                f"---\n{prctx.SUMMARY_MARKER}\n{summary_text}"
+                            )
+                        except Exception as exc:
+                            log.warning("reviewer.summary_post_failed", error=str(exc))
+                except Exception as exc:
+                    log.warning("reviewer.summary_failed", error=str(exc))
+            if ctx.debate_summary:
+                comments_summary += (
+                    f"## 📋 Debate summary (round {ctx.debate_round})\n"
+                    f"{ctx.debate_summary}\n\n"
+                    f"---\n## 최근 raw 코멘트 (참고용)\n"
+                )
             if comments:
                 lines = []
                 for c in comments[-10:]:
@@ -654,7 +721,7 @@ async def run_code_reviewer(
                         human_feedback_present = True
                     snippet = c["body"][:1200]
                     lines.append(f"--- {author} @ {c['createdAt']} ---\n{snippet}")
-                comments_summary = "\n\n".join(lines)
+                comments_summary += "\n\n".join(lines)
 
             # 프롬프트 빌드 — mode 별 prompt 파일 다름
             prompt_name = "code-reviewer-local" if mode == "local" else "code-reviewer"
