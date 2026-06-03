@@ -145,6 +145,10 @@ cat > "$PLIST" <<EOF
     <true/>
     <key>WorkingDirectory</key>
     <string>${REPO_CWD}</string>
+    <key>AbandonProcessGroup</key>
+    <true/>
+    <key>ExitTimeOut</key>
+    <integer>3600</integer>
     <key>StandardOutPath</key>
     <string>${LOG_DIR}/${SLUG}.out</string>
     <key>StandardErrorPath</key>
