@@ -474,6 +474,21 @@ async def _sot_batch_impl(repo: str, cwd: Path, threshold: int,
             print(f"    - {t}")
 
 
+@app.command("dashboard")
+def dashboard(
+    repo: list[str] = typer.Option([], "--repo", "-r",
+                                    help="대상 repo (여러 번 가능). 미지정 시 launchd 에서 자동 감지"),
+    interval: float = typer.Option(5.0, "--interval", "-i",
+                                   help="refresh 주기 (초). default 5"),
+) -> None:
+    """로컬 agentic-harness 작업 상태 + 로그 + 비용 TUI 대시보드.
+
+    Ctrl-C 로 종료.
+    """
+    from orchestrator.dashboard import run_dashboard
+    asyncio.run(run_dashboard(repos=list(repo) or None, refresh_sec=interval))
+
+
 @app.command("sot-drift-check")
 def sot_drift_check(
     repo: str = typer.Option(..., "--repo", "-r"),
