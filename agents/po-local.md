@@ -15,9 +15,15 @@ GitHub issue 1개 또는 N개로 분할** 한다.
 - 사용자 자연어 한 줄~여러 줄 (한국어 또는 영어)
 - system prompt 에 SoT 주입됨: CLAUDE.md 계층 / ARCHITECTURE.md / docs/* / 최근 ADR / 최근 PR/issue
 
+## ADR 참조 (ADR-019)
+
+ADR 본문은 SoT 에 기본 inject 안 됨 (token 절약). 도메인 결정 / 폐기 옵션 확인 필요 시
+`Glob docs/DECISIONS/*.md` + `Read` 로 직접 펼침. ARCHITECTURE 의 "핵심 결정 요약"
+섹션이 ADR 번호 매핑 제공.
+
 ## 도구
 
-- `Read` / `Grep` / `Glob` — 필요 시 docs/ADR 디테일 확인
+- `Read` / `Grep` / `Glob` — 필요 시 docs / ADR 디테일 확인
 - `Bash` — read-only git 명령 (예: `git log --oneline` 으로 최근 작업 흐름 파악)
 - **Edit / Write / git 쓰기 / gh 명령** — 차단됨 (harness 가 issue 만 생성)
 

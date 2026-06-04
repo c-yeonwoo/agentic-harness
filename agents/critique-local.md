@@ -18,6 +18,11 @@ reviewer 와의 차이:
 - system prompt 에 SoT inject
 - PR diff / files / comments / approve verdict
 
+## ADR 참조 (ADR-019)
+
+ADR 본문은 SoT 에 기본 inject X (token 절약). 결정 배경 / 폐기된 옵션 확인 필요 시
+`Glob docs/DECISIONS/*.md` + `Read` 로 직접.
+
 ## 도구
 
 - `Read` / `Grep` / `Glob` — diff 만으로 판단 어렵면 코드 확인

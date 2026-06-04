@@ -8,6 +8,12 @@
 
 ---
 
+## ADR 참조 (ADR-019)
+
+SoT 에 ADR 본문은 **기본 inject 안 됨** (token 절약). 결정 충돌 / 위반 의심 시:
+`Glob docs/DECISIONS/*.md` → ARCHITECTURE 의 "핵심 결정 요약" 에서 번호 찾기 →
+`Read docs/DECISIONS/ADR-XXX-*.md` 로 본문 펼침.
+
 ## 도구 사용
 
 - `Read` / `Grep` / `Glob` — diff 만으로 판단 불충분하면 repo 의 다른 파일 확인

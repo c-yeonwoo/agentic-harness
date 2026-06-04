@@ -80,7 +80,10 @@ class SourceOfTruth:
                 parts.append(body)
                 parts.append("")
         if self.adr_summaries:
-            parts.append("## docs/DECISIONS/ (요약 — title + 첫 1.5KB. 필요 시 read_file 로 펼침)")
+            parts.append(
+                "## docs/DECISIONS/ ADR (선택 inject — `SOT_INCLUDE_ADR=full` 또는 "
+                "`.agentic.yml sot.adr_mode=full`. 본문은 Read 로 직접 펼침)"
+            )
             for adr in self.adr_summaries:
                 parts.append(f"### {adr['stem']}")
                 parts.append(adr['summary'])
@@ -333,14 +336,35 @@ async def discover(cwd: Path | str) -> SourceOfTruth:
             if txt:
                 docs_pages[p.name] = txt
 
-    # docs/DECISIONS/*.md — title + 첫 1.5KB (executor 가 필요 시 read_file 로 펼침)
+    # docs/DECISIONS/*.md — ADR 본문 inject (ADR-019: 기본 OFF, token 절약)
+    # 옵션: SOT_INCLUDE_ADR=true / titles 시 title list 만, full 시 본문
+    # 또는 .agentic.yml 의 sot.adr_mode: off | titles | full
     adr_summaries: list[dict] = []
+    sot_cfg = (agentic_yml.get("sot", {}) or {})
+    adr_mode = (
+        sot_cfg.get("adr_mode")
+        or os.environ.get("SOT_INCLUDE_ADR", "off")
+    ).strip().lower()
+    # backward compat: true / yes → full
+    if adr_mode in ("true", "yes", "1"):
+        adr_mode = "full"
+    if adr_mode not in ("off", "titles", "full"):
+        adr_mode = "off"
+
     adr_dir = docs_dir / "DECISIONS"
-    if adr_dir.exists():
+    if adr_dir.exists() and adr_mode != "off":
         for p in sorted(adr_dir.glob("*.md")):
-            txt = _read_or_none(p, limit=1500)
-            if txt:
-                adr_summaries.append({"stem": p.stem, "summary": txt})
+            if adr_mode == "titles":
+                # title 만 — 첫 # 헤더 라인
+                try:
+                    first_line = p.read_text(encoding="utf-8").splitlines()[0]
+                    adr_summaries.append({"stem": p.stem, "summary": first_line})
+                except Exception:
+                    continue
+            else:  # full
+                txt = _read_or_none(p, limit=1500)
+                if txt:
+                    adr_summaries.append({"stem": p.stem, "summary": txt})
 
     last_commits = _git_log(cwd, limit=20)
 

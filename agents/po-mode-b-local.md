@@ -39,7 +39,8 @@
 | 변경 종류 | 갱신 대상 |
 |---|---|
 | 새 도메인 / 모듈 boundary | `ARCHITECTURE.md` 의 도메인 섹션 |
-| 새 ADR 추가 | `ARCHITECTURE.md` 의 "참고 ADR" 갱신 (옵션) |
+| 새 ADR 추가 | **`ARCHITECTURE.md` 의 "핵심 결정 요약" 섹션에 한 줄 + ADR 번호 (필수, ADR-019)** |
+| 새 ADR 작성 | `docs/DECISIONS/_TEMPLATE.md` 양식 따름 (50~100줄) |
 | 새 도메인 용어 / 약어 | `GLOSSARY.md` |
 | 코딩 컨벤션 변경 | `CONVENTIONS.md` |
 | 빌드 / 테스트 명령 변경 | `CLAUDE.md` 의 명령 섹션 |
