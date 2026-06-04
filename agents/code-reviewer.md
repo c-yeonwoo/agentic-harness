@@ -37,6 +37,8 @@ PRs/issues) 주입. User message:
   ],
   "needs_adr": false,
   "adr_reason": "needs_adr=true 일 때 — ADR 필요한 결정 사항",
+  "sot_impact": "high | medium | low",
+  "sot_impact_reason": "왜 그 영향도인지 1-2 줄 (low 면 빈 문자열 OK)",
   "positives": [
     "잘 한 점 1-2개 (sandwich feedback)"
   ]
@@ -57,6 +59,14 @@ PRs/issues) 주입. User message:
 - 새 외부 의존성 추가
 - 도메인 scope 경계 변경 (다른 도메인 침범)
 - 일반 코드 변경 (component split / refactor / bugfix) — **false**
+
+## sot_impact 판정 (ADR-017)
+
+- **high** — BREAKING / 새 ADR / 새 도메인·모듈 / 외부 의존성 추가 → merge 시 즉시 SoT 갱신
+- **medium** — ≥10 파일 또는 ≥500줄 / 도메인 안 큰 리팩터 → 주간 batch 큐
+- **low** — 작은 fix / typo / 테스트만 / 같은 모듈 안 isolated → SoT 영향 없음
+
+애매하면 보수적으로 low — 사람이 사후 `ah:sot-urgent` 부착 가능.
 
 ## Severity 가이드
 

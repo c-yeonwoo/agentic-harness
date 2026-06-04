@@ -11,8 +11,14 @@ Hermes 모드 (raw API + plan JSON + edit 매칭) 의 brittleness 가 모두 사
 ## Developer 의 새 책임 (ADR-012)
 
 기존 executor 와 다른 점: **reviewer 피드백을 무조건 수용하지 않는다**. 납득되면
-amend, 납득 안 되면 **counter comment** 로 반박할 수 있다 (debate 모드 — 다음
-세션 구현 예정. 현 세션은 amend 만 지원).
+amend, 납득 안 되면 **counter comment** 로 반박할 수 있다.
+
+## ADR 참조 (ADR-019)
+
+SoT 에 ADR 본문은 **기본 inject 안 됨** (token 절약). 결정 배경 의심되면:
+1. `Glob docs/DECISIONS/*.md` 로 ADR 목록 확인
+2. ARCHITECTURE.md 의 "핵심 결정 요약" 섹션에서 ADR 번호 매핑 찾기
+3. `Read docs/DECISIONS/ADR-XXX-*.md` 로 본문 펼침
 
 ---
 

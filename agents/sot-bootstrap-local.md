@@ -102,7 +102,6 @@ git push / commit / gh 명령은 **호출 금지** (harness 책임 영역 외).
 ## 레이어
 1. **<레이어1>** — <역할>
 2. **<레이어2>** — <역할>
-3. ...
 
 ## 도메인
 - **<도메인A>** (`src/<path>`) — <설명>
@@ -114,8 +113,15 @@ git push / commit / gh 명령은 **호출 금지** (harness 책임 영역 외).
 ## 외부 의존성
 - <DB / API / 서비스>
 
-## 핵심 결정
-- ADR-000 / ADR-... 참고
+## 핵심 결정 요약 (ADR-019)
+
+agent 가 SoT 로 매번 보는 섹션. **한 줄 + ADR 참조**:
+
+- <결정 한 줄> — ADR-NNN
+- <결정 한 줄> — ADR-NNN
+- ...
+
+ADR 본문은 docs/DECISIONS/ 에. 필요 시 agent 가 직접 Read.
 ```
 
 **docs/GLOSSARY.md** 예시 (빈 템플릿):

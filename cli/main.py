@@ -391,6 +391,231 @@ async def _init_labels_impl(repo: str) -> None:
 # ── inspect ─────────────────────────────────────────────────────────────────
 
 
+# ── SoT update (ADR-017) ─────────────────────────────────────────────────────
+
+
+@app.command("sot-batch")
+def sot_batch(
+    repo: str = typer.Option(..., "--repo", "-r"),
+    cwd: Optional[Path] = typer.Option(None, "--cwd", "-c"),
+    threshold: int = typer.Option(5, "--threshold",
+                                  help="이 갯수 이상 모이면 batch 처리"),
+    force: bool = typer.Option(False, "--force",
+                               help="threshold 무시하고 1개 이상이면 처리"),
+    dry_run: bool = typer.Option(False, "--dry-run"),
+) -> None:
+    """주간 batch — `ah:sot-batch` 라벨 merged PR 들 모아서 SoT 갱신 PR 1개 생성.
+
+    launchd weekly cron 에서 자동 호출되거나 사람이 수동 트리거.
+    """
+    if cwd is None:
+        name = repo.split("/")[-1]
+        for cand in (Path.home() / "dev-private" / name, Path.home() / "dev" / name):
+            if (cand / ".git").exists():
+                cwd = cand; break
+        if cwd is None:
+            log.error("sot-batch.no_cwd"); sys.exit(2)
+    asyncio.run(_sot_batch_impl(repo, cwd, threshold, force, dry_run))
+
+
+async def _sot_batch_impl(repo: str, cwd: Path, threshold: int,
+                          force: bool, dry_run: bool) -> None:
+    from orchestrator import agents
+
+    # ah:sot-batch + merged PR 수집
+    prs_raw = await gh.list_prs(repo, label="ah:sot-batch", state="closed", limit=50)
+    merged = [p for p in prs_raw if p.merged]
+    pr_numbers = [p.number for p in merged]
+
+    print(f"\n▶ ah:sot-batch + merged PRs: {len(pr_numbers)}")
+    for p in merged:
+        print(f"  - #{p.number} {p.title[:60]}")
+
+    if not pr_numbers:
+        print("\n  (큐 비어있음 — 처리할 PR 없음)")
+        return
+
+    if len(pr_numbers) < threshold and not force:
+        print(f"\n  threshold ({threshold}) 미달 — skip. --force 또는 더 모이길 대기.")
+        return
+
+    if dry_run:
+        print(f"\n  --dry-run — 위 {len(pr_numbers)} 개 PR 분석 + SoT PR 생성 예정")
+        return
+
+    print(f"\n▶ PO mode B (batch) 실행 — {len(pr_numbers)} PR 통합 분석 ...")
+    res = await agents.run_po_mode_b(
+        repo=repo, repo_cwd=cwd,
+        pr_numbers=pr_numbers, mode="batch",
+    )
+
+    if not res.get("ok"):
+        print(f"\n❌ 실패: {res.get('error')}")
+        sys.exit(1)
+
+    if res.get("no_changes"):
+        print(f"\n  변경 없음 — SoT 영향 실질 0. 라벨만 정리.")
+    else:
+        print(f"\n✓ SoT 갱신 PR 생성: #{res.get('pr_number')}")
+        print(f"  {res.get('pr_url')}")
+        print(f"  files: {', '.join(res.get('files_changed', []))}")
+
+    # 처리된 PR 들의 ah:sot-batch 라벨 제거
+    for n in pr_numbers:
+        try:
+            await gh.remove_label(repo, "pr", n, "ah:sot-batch")
+        except Exception:
+            pass
+
+    print(f"  cost: ${res.get('cost_usd', 0):.4f} · model: {res.get('model', '')}")
+    if res.get("todos"):
+        print(f"  TODO:")
+        for t in res["todos"][:5]:
+            print(f"    - {t}")
+
+
+@app.command("sot-drift-check")
+def sot_drift_check(
+    repo: str = typer.Option(..., "--repo", "-r"),
+    cwd: Optional[Path] = typer.Option(None, "--cwd", "-c"),
+    create_issue: bool = typer.Option(True, "--create-issue/--no-create-issue",
+                                      help="drift 발견 시 GitHub issue 자동 생성"),
+) -> None:
+    """SoT 가 실제 코드 반영하는지 점검 (월 1회 권장, ~$2)."""
+    if cwd is None:
+        name = repo.split("/")[-1]
+        for cand in (Path.home() / "dev-private" / name, Path.home() / "dev" / name):
+            if (cand / ".git").exists():
+                cwd = cand; break
+        if cwd is None:
+            log.error("sot-drift-check.no_cwd"); sys.exit(2)
+    asyncio.run(_sot_drift_check_impl(repo, cwd, create_issue))
+
+
+async def _sot_drift_check_impl(repo: str, cwd: Path, create_issue: bool) -> None:
+    from orchestrator.runners.local_claude import run_sot_drift_check_local
+    from orchestrator.source_of_truth import discover
+
+    print(f"\n▶ SoT drift check — {repo}")
+    print(f"  cwd: {cwd}")
+    print(f"  점검 중 (claude -p sonnet) ...\n")
+
+    sot = await discover(cwd)
+    res = await run_sot_drift_check_local(
+        repo_cwd=cwd, repo=repo, sot_prompt=sot.to_prompt(),
+    )
+
+    if res.error:
+        print(f"❌ 실패: {res.error}")
+        print(f"  cost: ${res.cost_usd:.4f}")
+        sys.exit(1)
+
+    sev_emoji = {"none": "✅", "minor": "🟡", "major": "🔴"}.get(res.severity, "❓")
+    print(f"{sev_emoji} severity: {res.severity}")
+    print(f"  {res.summary}\n")
+
+    if res.drifts:
+        print(f"  drift {len(res.drifts)}건:")
+        for i, d in enumerate(res.drifts, 1):
+            print(f"\n  [{i}] {d.get('kind', '?')} ({d.get('severity', '?')})")
+            print(f"      {d.get('what', '?')}")
+            if d.get("evidence"):
+                print(f"      증거: {d['evidence']}")
+            if d.get("suggested_fix"):
+                print(f"      제안: {d['suggested_fix']}")
+
+    if create_issue and res.create_issue and res.severity != "none":
+        try:
+            issue = await gh.create_issue(
+                repo, title=res.issue_title or f"SoT drift 점검 — {len(res.drifts)}건",
+                body=res.issue_body, labels=[],
+            )
+            print(f"\n✓ Issue 생성됨: #{issue.number}")
+            print(f"  {issue.url}")
+        except Exception as exc:
+            print(f"\n  ⚠ issue 생성 실패: {exc}")
+    elif res.severity != "none":
+        print(f"\n  (--no-create-issue 또는 create_issue=false — issue 안 만들음)")
+
+    print(f"\n  cost: ${res.cost_usd:.4f} · model: {res.model}")
+
+
+@app.command("cost")
+def cost(
+    since: str = typer.Option("1w", "--since", "-s",
+                              help="기간 (1d / 1w / 1m / ISO date). default 1주"),
+    repo: Optional[str] = typer.Option(None, "--repo", "-r",
+                                       help="repo 명시 시 PR comments 도 합산 (정확). 미지정 시 로그만"),
+    source: str = typer.Option("auto", "--source",
+                               help="auto | log | pr — auto = 로그 + (repo 있으면) PR"),
+) -> None:
+    """누적 비용 집계 — 로그 파일 + (옵션) GitHub PR comments."""
+    from orchestrator import cost_report as cr
+    try:
+        since_epoch = cr._parse_since(since)
+    except ValueError as exc:
+        log.error("cost.bad_since", error=str(exc)); sys.exit(2)
+    asyncio.run(_cost_impl(since_epoch, repo, source))
+
+
+async def _cost_impl(since_epoch: float, repo: Optional[str], source: str) -> None:
+    from orchestrator import cost_report as cr
+    entries = []
+    if source in ("auto", "log"):
+        log_entries = cr.from_logs(since_epoch)
+        entries.extend(log_entries)
+        log.info("cost.log_entries", count=len(log_entries))
+    if source in ("auto", "pr") and repo:
+        try:
+            pr_entries = await cr.from_pr_comments(repo, since_epoch)
+            entries.extend(pr_entries)
+            log.info("cost.pr_entries", count=len(pr_entries), repo=repo)
+        except Exception as exc:
+            log.warning("cost.pr_failed", error=str(exc))
+
+    report = cr.CostReport(entries=entries, since=since_epoch)
+    print(cr.format_report(report))
+
+
+@app.command("sot-refresh")
+def sot_refresh(
+    pr: int = typer.Argument(..., help="대상 PR 번호 (merged 여야 함)"),
+    repo: str = typer.Option(..., "--repo", "-r"),
+    cwd: Optional[Path] = typer.Option(None, "--cwd", "-c"),
+) -> None:
+    """단일 PR 즉시 SoT 갱신 — `ah:sot-urgent` PR 의 즉시 트리거 수동 버전."""
+    if cwd is None:
+        name = repo.split("/")[-1]
+        for cand in (Path.home() / "dev-private" / name, Path.home() / "dev" / name):
+            if (cand / ".git").exists():
+                cwd = cand; break
+        if cwd is None:
+            log.error("sot-refresh.no_cwd"); sys.exit(2)
+    asyncio.run(_sot_refresh_impl(repo, cwd, pr))
+
+
+async def _sot_refresh_impl(repo: str, cwd: Path, pr_number: int) -> None:
+    from orchestrator import agents
+    print(f"\n▶ PO mode B (urgent, manual) — PR #{pr_number} ...")
+    res = await agents.run_po_mode_b(
+        repo=repo, repo_cwd=cwd, pr_numbers=[pr_number], mode="urgent",
+    )
+    if not res.get("ok"):
+        print(f"\n❌ 실패: {res.get('error')}")
+        sys.exit(1)
+    if res.get("no_changes"):
+        print(f"\n  변경 없음 — SoT 영향 실질 0.")
+    else:
+        print(f"\n✓ SoT 갱신 PR 생성: #{res.get('pr_number')}")
+        print(f"  {res.get('pr_url')}")
+        print(f"  files: {', '.join(res.get('files_changed', []))}")
+    try:
+        await gh.remove_label(repo, "pr", pr_number, "ah:sot-urgent")
+    except Exception:
+        pass
+    print(f"  cost: ${res.get('cost_usd', 0):.4f}")
+
+
 @app.command("inspect")
 def inspect(
     issue: int = typer.Argument(..., help="issue 또는 PR 번호"),

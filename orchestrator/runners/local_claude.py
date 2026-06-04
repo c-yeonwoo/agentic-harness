@@ -482,6 +482,145 @@ class LocalPoResult:
     error: Optional[str] = None
 
 
+@dataclass
+class LocalPoModeBResult:
+    """PO mode B (SoT 갱신) 결과."""
+    summary: str = ""
+    mode: str = ""                      # urgent | batch
+    analyzed_prs: list = None           # type: ignore
+    files_changed: list = None          # type: ignore
+    files_skipped: list = None          # type: ignore
+    pr_title: str = ""
+    pr_body: str = ""
+    todos: list = None                  # type: ignore
+    raw_text: str = ""
+    cost_usd: float = 0.0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    model: str = ""
+    error: Optional[str] = None
+
+    def __post_init__(self):
+        if self.analyzed_prs is None: self.analyzed_prs = []
+        if self.files_changed is None: self.files_changed = []
+        if self.files_skipped is None: self.files_skipped = []
+        if self.todos is None: self.todos = []
+
+
+async def run_po_mode_b_local(
+    *,
+    repo_cwd: Path,
+    repo: str,
+    target_prs: list,                   # [{number, title, body, diff (str), files (list), ...}]
+    sot_prompt: str,
+    mode: str = "urgent",               # urgent | batch
+    timeout_sec: int = 1200,
+    model: Optional[str] = None,
+) -> LocalPoModeBResult:
+    """PO mode B — merged PR(s) 보고 SoT 파일 갱신 (Read/Edit/Write 직접).
+
+    실제 git commit / PR 생성은 호출자 (agents.run_po_mode_b) 가 담당.
+    """
+    from orchestrator.runners import resolve_local_model
+    model = model or resolve_local_model("po")  # default: sonnet
+
+    agents_dir = Path(__file__).resolve().parent.parent.parent / "agents"
+    role_prompt_path = agents_dir / "po-mode-b-local.md"
+    if not role_prompt_path.exists():
+        return LocalPoModeBResult(
+            mode=mode, error=f"agents/po-mode-b-local.md 없음 — {role_prompt_path}",
+        )
+    role_prompt = role_prompt_path.read_text(encoding="utf-8")
+    system_prompt = role_prompt + "\n\n## 현재 SoT\n\n" + sot_prompt
+
+    # target_prs 를 prompt 에 압축
+    prs_text = ""
+    for p in target_prs:
+        diff_excerpt = (p.get("diff") or "")[:5000]
+        files_summary = "\n".join(
+            f"  - {f.get('path', '?')} (+{f.get('additions', 0)} / -{f.get('deletions', 0)})"
+            for f in (p.get("files") or [])[:20]
+        )
+        prs_text += (
+            f"\n### PR #{p.get('number')}: {p.get('title', '')}\n"
+            f"URL: {p.get('url', '')}\n"
+            f"Body:\n{(p.get('body') or '')[:1500]}\n\n"
+            f"Files changed ({len(p.get('files') or [])}):\n{files_summary}\n\n"
+            f"Diff excerpt (~5KB):\n```diff\n{diff_excerpt}\n```\n"
+        )
+
+    user_prompt = (
+        f"# PO Mode B — SoT 갱신 (mode={mode})\n\n"
+        f"target repo: {repo}\n"
+        f"cwd: `{repo_cwd}`\n"
+        f"분석 대상 PR 갯수: {len(target_prs)}\n\n"
+        f"## PRs\n{prs_text}\n\n"
+        f"---\n\n"
+        f"위 PR 들의 변경을 분석하고, **현재 cwd 의 SoT 파일** 을 Read 로 확인 후 "
+        f"필요한 부분만 Edit/Write 로 갱신해. 최소 수정 원칙. "
+        f"애매하면 `> TODO: ...` 명시. "
+        f"작업 끝나면 system prompt 의 schema 그대로 JSON 출력."
+    )
+
+    log.info("po.mode_b.spawn", repo=repo, mode=mode, prs=len(target_prs), model=model)
+
+    rc, stdout, stderr = await _spawn_claude(
+        cwd=repo_cwd,
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        timeout_sec=timeout_sec,
+        extra_disallowed=[],  # Edit / Write 허용 — SoT 파일 직접 수정
+        model=model,
+    )
+
+    assistant_text, env = _parse_claude_json_envelope(stdout)
+    if assistant_text is None:
+        assistant_text = stdout
+
+    cost = float(env.get("total_cost_usd") or 0.0)
+    usage = env.get("usage") or {}
+    in_tok = int(usage.get("input_tokens") or 0)
+    out_tok = int(usage.get("output_tokens") or 0)
+    used_model = env.get("model") or model or ""
+    is_error = bool(env.get("is_error"))
+
+    if rc != 0 or is_error:
+        api_status = env.get("api_error_status")
+        detail = (assistant_text or "").strip() or stderr.strip() or stdout.strip()[:600]
+        err = f"PO mode B failed — rc={rc} api_status={api_status}: {detail[:600]}"
+        log.warning("po.mode_b.failed",
+                    rc=rc, api_status=api_status, stderr_head=stderr[:300])
+        return LocalPoModeBResult(
+            mode=mode, raw_text=assistant_text or "",
+            cost_usd=cost, input_tokens=in_tok, output_tokens=out_tok,
+            model=used_model, error=err,
+        )
+
+    payload = _extract_result_json(assistant_text)
+    if not isinstance(payload, dict):
+        m = re.search(r"```(?:json)?\s*\n(\{[\s\S]*?\})\s*\n```", assistant_text or "")
+        if m:
+            try:
+                payload = json.loads(m.group(1))
+            except json.JSONDecodeError:
+                payload = None
+    if not isinstance(payload, dict):
+        payload = {}
+
+    return LocalPoModeBResult(
+        summary=payload.get("summary") or "",
+        mode=payload.get("mode") or mode,
+        analyzed_prs=payload.get("analyzed_prs") or [],
+        files_changed=payload.get("files_changed") or [],
+        files_skipped=payload.get("files_skipped") or [],
+        pr_title=payload.get("pr_title") or "",
+        pr_body=payload.get("pr_body") or "",
+        todos=payload.get("todos") or [],
+        raw_text=assistant_text or "",
+        cost_usd=cost, input_tokens=in_tok, output_tokens=out_tok, model=used_model,
+    )
+
+
 async def run_po_mode_a_local(
     *,
     repo_cwd: Path,
@@ -605,6 +744,191 @@ async def run_po_mode_a_local(
         raw_text=assistant_text or "",
         cost_usd=cost, input_tokens=in_tok, output_tokens=out_tok,
         model=used_model,
+    )
+
+
+@dataclass
+class LocalSotDriftResult:
+    """SoT drift check 결과."""
+    severity: str = "none"          # none | minor | major
+    summary: str = ""
+    drifts: list = None             # type: ignore
+    create_issue: bool = False
+    issue_title: str = ""
+    issue_body: str = ""
+    raw_text: str = ""
+    cost_usd: float = 0.0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    model: str = ""
+    error: Optional[str] = None
+
+    def __post_init__(self):
+        if self.drifts is None: self.drifts = []
+
+
+async def run_sot_drift_check_local(
+    *,
+    repo_cwd: Path,
+    repo: str,
+    sot_prompt: str,
+    timeout_sec: int = 900,
+    model: Optional[str] = None,
+) -> LocalSotDriftResult:
+    """SoT drift check — claude -p 가 SoT 와 실제 코드 비교."""
+    from orchestrator.runners import resolve_local_model
+    model = model or resolve_local_model("po")
+
+    agents_dir = Path(__file__).resolve().parent.parent.parent / "agents"
+    prompt_path = agents_dir / "sot-drift-check-local.md"
+    if not prompt_path.exists():
+        return LocalSotDriftResult(error=f"agents/sot-drift-check-local.md 없음")
+    role_prompt = prompt_path.read_text(encoding="utf-8")
+    system_prompt = role_prompt + "\n\n" + sot_prompt
+
+    user_prompt = (
+        f"# SoT Drift Check\n\nrepo: {repo}\ncwd: `{repo_cwd}`\n\n"
+        f"위 SoT 가 실제 코드를 잘 반영하는지 sampling 으로 점검. "
+        f"빌드 명령 / 디렉토리 구조 / GLOSSARY 누락 / ADR vs 코드 / 컨벤션 위반 "
+        f"순서로 확인. drift 발견 시 JSON 으로 정리."
+    )
+
+    log.info("sot_drift.spawn", repo=repo, model=model)
+    rc, stdout, stderr = await _spawn_claude(
+        cwd=repo_cwd,
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        timeout_sec=timeout_sec,
+        extra_disallowed=["Edit", "Write"],  # 점검만 — 수정 X
+        model=model,
+    )
+
+    assistant_text, env = _parse_claude_json_envelope(stdout)
+    if assistant_text is None:
+        assistant_text = stdout
+
+    cost = float(env.get("total_cost_usd") or 0.0)
+    usage = env.get("usage") or {}
+    in_tok = int(usage.get("input_tokens") or 0)
+    out_tok = int(usage.get("output_tokens") or 0)
+    used_model = env.get("model") or model or ""
+    is_error = bool(env.get("is_error"))
+
+    if rc != 0 or is_error:
+        return LocalSotDriftResult(
+            raw_text=assistant_text or "",
+            cost_usd=cost, input_tokens=in_tok, output_tokens=out_tok,
+            model=used_model,
+            error=f"drift check failed — rc={rc}",
+        )
+
+    payload = _extract_result_json(assistant_text)
+    if not isinstance(payload, dict):
+        m = re.search(r"```(?:json)?\s*\n(\{[\s\S]*?\})\s*\n```", assistant_text or "")
+        if m:
+            try: payload = json.loads(m.group(1))
+            except json.JSONDecodeError: payload = None
+    if not isinstance(payload, dict):
+        payload = {}
+
+    return LocalSotDriftResult(
+        severity=payload.get("severity") or "none",
+        summary=payload.get("summary") or "",
+        drifts=payload.get("drifts") or [],
+        create_issue=bool(payload.get("create_issue")),
+        issue_title=payload.get("issue_title") or "",
+        issue_body=payload.get("issue_body") or "",
+        raw_text=assistant_text or "",
+        cost_usd=cost, input_tokens=in_tok, output_tokens=out_tok, model=used_model,
+    )
+
+
+@dataclass
+class LocalCritiqueResult:
+    """run_critique_local 의 반환 — suggestion 들 + overall judgment."""
+    summary: str = ""
+    overall_judgment: str = "ship"
+    suggestions: list = None      # type: ignore
+    positives: list = None        # type: ignore
+    raw_text: str = ""
+    cost_usd: float = 0.0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    model: str = ""
+    error: Optional[str] = None
+
+    def __post_init__(self):
+        if self.suggestions is None: self.suggestions = []
+        if self.positives is None: self.positives = []
+
+
+async def run_critique_local(
+    *,
+    repo_cwd: Path,
+    system_prompt: str,
+    user_prompt: str,
+    timeout_sec: int = 1200,
+    model: Optional[str] = None,
+) -> LocalCritiqueResult:
+    """Critique agent — PR 에 메타 비평 (block 권한 없음, suggestion only)."""
+    from orchestrator.runners import resolve_local_model
+    model = model or resolve_local_model("critique")  # default sonnet
+
+    log.info("critique.local.spawn", cwd=str(repo_cwd), model=model)
+
+    rc, stdout, stderr = await _spawn_claude(
+        cwd=repo_cwd,
+        system_prompt=system_prompt,
+        user_prompt=user_prompt,
+        timeout_sec=timeout_sec,
+        extra_disallowed=["Edit", "Write"],  # critique 도 코드 수정 X
+        model=model,
+    )
+
+    assistant_text, env = _parse_claude_json_envelope(stdout)
+    if assistant_text is None:
+        assistant_text = stdout
+
+    cost = float(env.get("total_cost_usd") or 0.0)
+    usage = env.get("usage") or {}
+    in_tok = int(usage.get("input_tokens") or 0)
+    out_tok = int(usage.get("output_tokens") or 0)
+    used_model = env.get("model") or model or ""
+    is_error = bool(env.get("is_error"))
+
+    if rc != 0 or is_error:
+        api_status = env.get("api_error_status")
+        detail = (assistant_text or "").strip() or stderr.strip() or stdout.strip()[:600]
+        return LocalCritiqueResult(
+            raw_text=assistant_text or "",
+            cost_usd=cost, input_tokens=in_tok, output_tokens=out_tok,
+            model=used_model,
+            error=f"critique failed — rc={rc} api_status={api_status}: {detail[:600]}",
+        )
+
+    payload = _extract_result_json(assistant_text)
+    if not isinstance(payload, dict):
+        m = re.search(r"```(?:json)?\s*\n(\{[\s\S]*?\})\s*\n```", assistant_text or "")
+        if m:
+            try:
+                payload = json.loads(m.group(1))
+            except json.JSONDecodeError:
+                payload = None
+    if not isinstance(payload, dict):
+        return LocalCritiqueResult(
+            raw_text=assistant_text or "",
+            cost_usd=cost, input_tokens=in_tok, output_tokens=out_tok,
+            model=used_model,
+            error="critique JSON 파싱 실패",
+        )
+
+    return LocalCritiqueResult(
+        summary=payload.get("summary") or "",
+        overall_judgment=payload.get("overall_judgment") or "ship",
+        suggestions=payload.get("suggestions") or [],
+        positives=payload.get("positives") or [],
+        raw_text=assistant_text or "",
+        cost_usd=cost, input_tokens=in_tok, output_tokens=out_tok, model=used_model,
     )
 
 

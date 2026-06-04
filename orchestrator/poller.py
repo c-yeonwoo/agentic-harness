@@ -112,6 +112,69 @@ async def poll_once(repo: str, cwd: Path, bot_user: str) -> dict:
             else:
                 stats["skipped"] += 1
 
+    # 4) ah:needs-critique PRs → critique (final gate, suggestion-only) — ADR-012
+    try:
+        c_raw = await gh.list_prs(repo, label="ah:needs-critique")
+    except Exception as exc:
+        log.warning("poll.list_failed", error=str(exc), agent="critique")
+        c_raw = []
+    c_candidates = _filter_unlocked(c_raw, bot_user)
+
+    if c_candidates:
+        log.info("poll.found", count=len(c_candidates), agent="critique")
+        slots = c_candidates[:max_reviewers]
+        results = await asyncio.gather(
+            *[agents.run_code_critique(repo, p, sot, bot_user, repo_cwd=cwd) for p in slots],
+            return_exceptions=True,
+        )
+        for r in results:
+            if isinstance(r, Exception):
+                stats["errors"] += 1
+                log.warning("poll.critique_exc", error=str(r))
+            elif r:
+                stats.setdefault("critiqued", 0)
+                stats["critiqued"] += 1
+            else:
+                stats["skipped"] += 1
+
+    # 5) ah:sot-urgent merged PRs → PO mode B (즉시 단일 PR 분석) — ADR-017
+    try:
+        u_raw = await gh.list_prs(
+            repo, label="ah:sot-urgent", state="closed", limit=10,
+        )
+        # merged 만 (closed but not merged 면 무시)
+        u_merged = [p for p in u_raw if p.merged]
+    except Exception as exc:
+        log.warning("poll.list_failed", error=str(exc), agent="po-mode-b-urgent")
+        u_merged = []
+
+    if u_merged:
+        log.info("poll.found", count=len(u_merged), agent="po-mode-b-urgent")
+        # 즉시 모드는 1번에 1개 처리 (병렬 X — SoT 동시 수정 충돌 방지)
+        for p in u_merged[:1]:
+            try:
+                res = await agents.run_po_mode_b(
+                    repo=repo, repo_cwd=cwd,
+                    pr_numbers=[p.number], mode="urgent",
+                )
+                if res.get("ok"):
+                    # 처리됐으면 ah:sot-urgent 라벨 제거 (재처리 방지)
+                    try:
+                        await gh.remove_label(repo, "pr", p.number, "ah:sot-urgent")
+                    except Exception:
+                        pass
+                    stats.setdefault("sot_updated", 0)
+                    stats["sot_updated"] += 1
+                    log.info("po.mode_b.urgent.done", pr=p.number,
+                             sot_pr=res.get("pr_url"), cost=res.get("cost_usd"))
+                else:
+                    stats["errors"] += 1
+                    log.warning("po.mode_b.urgent.failed",
+                                pr=p.number, error=res.get("error"))
+            except Exception as exc:
+                stats["errors"] += 1
+                log.warning("poll.po_b_urgent_exc", error=str(exc))
+
     return stats
 
 
