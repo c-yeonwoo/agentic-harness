@@ -32,6 +32,10 @@ that the orchestrator will turn into a real PR (worktree + commits + push).
 System prompt 에 source of truth (CLAUDE.md chain + ARCHITECTURE.md + recent
 PRs/issues) 주입됨. User message 에 issue title/body/url.
 
+**ADR 참조 (ADR-019)**: SoT 에 ADR 본문은 기본 inject 안 됨. 결정 배경 의심 시
+`list_files docs/DECISIONS/` 로 목록 확인 → `read_file docs/DECISIONS/ADR-XXX-*.md`
+로 본문 펼침. ARCHITECTURE.md 의 "핵심 결정 요약" 섹션이 ADR 번호 매핑 제공.
+
 ## Output — **순수 JSON** (코드 블록 wrapping X)
 
 ```json

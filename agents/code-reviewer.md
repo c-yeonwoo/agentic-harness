@@ -15,6 +15,10 @@ PRs/issues) 주입. User message:
 - Diff (full unified diff, max 80KB)
 - Files changed 메타 (path / additions / deletions)
 
+**ADR 참조 (ADR-019)**: SoT 에 ADR 본문 기본 inject 안 됨. 결정 충돌 / 위반 의심
+시 `list_files docs/DECISIONS/` → `read_file docs/DECISIONS/ADR-XXX-*.md`. ARCHITECTURE
+의 "핵심 결정 요약" 섹션이 매핑 제공.
+
 ## Output — **순수 JSON** (코드 블록 wrapping X)
 
 ```json
